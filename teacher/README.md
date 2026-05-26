@@ -13,9 +13,12 @@ The conversion goal is to turn Holmes `SFTDATA.jsonl` rows into image-text examp
 ## Files
 
 - `convert_holmes_sft.py`: conversion script.
+- `build_derived_dataset.py`: deterministic builder that converts the existing `step2_draft` labels into multi-task student supervision without regenerating labels.
 - `stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl`: local generated teacher dataset.
 - `stage1_g31b_v5_full_balanced/stats.json`: conversion stats for the local dataset.
 - `stage1_g31b_v5_full_balanced/images/`: materialized images used by the local JSONL.
+- `derived_deterministic_v1/derived.jsonl`: derived student-training dataset generated from the existing labels.
+- `derived_deterministic_v1/manifest.json`: row counts, label counts, and example targets for the derived dataset.
 
 ## Source Data
 
@@ -73,7 +76,12 @@ Example row shape:
 }
 ```
 
-`student/src/dataset.py` converts this `step2_draft` format into the competition-facing `per_criterion` plus `aigc score` JSON during training.
+`build_derived_dataset.py` reads this generator-only schema and emits deterministic supervision targets for:
+
+- final competition JSON
+- evidence trace
+- taxonomy classification
+- consistency checking
 
 ## Criteria
 
@@ -165,6 +173,19 @@ python3 teacher/convert_holmes_sft.py \
   --output-root /tmp/lpcvc_teacher_smoke \
   --overwrite-images
 ```
+
+## Build Deterministic Derived Data
+
+This step does not call any new teacher or judge model. It reuses the existing `step2_draft` labels and writes a new JSONL for student multi-task training.
+
+```bash
+cd /ssd4/LPCVC2026/Module-II-Final
+python3 teacher/build_derived_dataset.py \
+  --input-jsonl teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl \
+  --output-root teacher/derived_deterministic_v1
+```
+
+The derived rows keep the original relative `image` and store `image_root`, so images are resolved from the original teacher dataset without duplication.
 
 ## Review Existing Drafts
 

@@ -1,10 +1,19 @@
 import json
 import os
 import random
-import torch
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+import torch
 from PIL import Image
+from torch.utils.data import Dataset
+
+from lpcvc_utils import (
+    CRITERIA,
+    DEFAULT_EVIDENCE,
+    json_dumps,
+)
 
 
 def set_seed(seed: int = 42):
@@ -17,99 +26,195 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-class HolmesSFTDataset(Dataset):
-    def __init__(self, jsonl_path, prompt_dir, processor, max_length=2048):
-        self.data = []
-        base_dir = os.path.dirname(jsonl_path)
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                item = json.loads(line.strip())
-                # Resolve image path
-                img_path = os.path.join(base_dir, item["image"])
-                if not os.path.exists(img_path):
-                    # fallback
-                    img_path = os.path.join(
-                        "/ssd4/LPCVC2026/dataset/holmes", item["image"]
-                    )
-                item["full_image_path"] = img_path
-                self.data.append(item)
+DEFAULT_TASK_MIX = {
+    "final_json": 0.40,
+    "evidence_trace": 0.35,
+    "taxonomy_classification": 0.15,
+    "consistency_check": 0.10,
+}
 
+DEFAULT_PROMPTS = {
+    "evidence_trace": (
+        "Analyze the image and return ONLY a JSON object with the following schema:\n"
+        "{\n"
+        '  "overall_likelihood": "Real" | "Uncertain" | "AI-Generated",\n'
+        '  "per_criterion": [{"criterion": "...", "score": 0 or 1, "evidence": "...", '
+        '"support_type": "explicit_holmes | implied_holmes | image_only | unsupported", '
+        '"holmes_span": "...", "artifact_taxonomy": "...", "non_applicable": true/false, '
+        '"artifact_score_conflict": true/false}]\n'
+        "}\n"
+        f"Use these exact criteria in order: {', '.join(CRITERIA)}."
+    ),
+    "taxonomy_classification": (
+        "Analyze the image and return ONLY a JSON object that lists the exact LPCVC criteria in order.\n"
+        'For each criterion output {"criterion": "...", "artifact_taxonomy": "...", "support_type": "..."}.\n'
+        "Use artifact_taxonomy=none when no grounded artifact is visible."
+    ),
+    "consistency_check": (
+        "Analyze the image and return ONLY a JSON object assessing whether each LPCVC criterion would have a score"
+        ' that is consistent with its evidence. Use the schema {"overall_consistent": true/false, '
+        '"expected_overall_likelihood": "Real" | "AI-Generated", '
+        '"per_criterion": [{"criterion": "...", "consistent": true/false, "reason": "..."}]}.'
+    ),
+}
+
+
+class DerivedMultiTaskDataset(Dataset):
+    def __init__(
+        self,
+        jsonl_path,
+        prompt_dir,
+        processor,
+        max_length=2048,
+        task_mix: Optional[Dict[str, float]] = None,
+        expert_targets_path: Optional[str] = None,
+        seed: int = 42,
+    ):
+        self.data = []
+        self.epoch = 0
+        self.seed = seed
         self.processor = processor
         self.max_length = max_length
         self.prompt_dir = prompt_dir
-
+        self.task_mix = task_mix or dict(DEFAULT_TASK_MIX)
+        self.task_names = list(self.task_mix.keys())
+        self.task_probs = self._normalize_task_mix(self.task_mix)
         self.prompts = self._load_prompts()
+        self.expert_targets = self._load_expert_targets(expert_targets_path)
+
+        jsonl_path = Path(jsonl_path)
+        base_dir = jsonl_path.parent
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                image_path = Path(item["image"])
+                if not image_path.is_absolute():
+                    image_root = item.get("image_root")
+                    if image_root:
+                        image_path = Path(image_root) / item["image"]
+                    else:
+                        image_path = base_dir / item["image"]
+                item["full_image_path"] = os.fspath(image_path)
+                self.data.append(item)
+
+    def _normalize_task_mix(self, task_mix: Dict[str, float]) -> List[float]:
+        total = sum(max(0.0, float(value)) for value in task_mix.values())
+        if total <= 0:
+            raise ValueError("task_mix must contain positive weights")
+        return [max(0.0, float(task_mix[name])) / total for name in self.task_names]
+
+    def _load_expert_targets(self, expert_targets_path: Optional[str]) -> Dict[str, Dict[str, torch.Tensor]]:
+        if not expert_targets_path:
+            return {}
+        path = Path(expert_targets_path)
+        if path.is_dir():
+            path = path / "dataset_logits.jsonl"
+        if not path.exists():
+            return {}
+        targets = {}
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                targets[str(row["image"])] = {
+                    "expert_overall_prob": torch.tensor(
+                        [float(torch.sigmoid(torch.tensor(row["overall_logit"])).item())],
+                        dtype=torch.float32,
+                    ),
+                    "expert_criterion_probs": torch.sigmoid(
+                        torch.tensor(row["criterion_logits"], dtype=torch.float32)
+                    ),
+                }
+        return targets
 
     def _load_prompts(self):
         prompts = {}
-        stage1_path = os.path.join(self.prompt_dir, "stage1.txt")
-        stage2_path = os.path.join(self.prompt_dir, "stage2.txt")
-
-        if os.path.exists(stage1_path):
-            with open(stage1_path, "r", encoding="utf-8") as f:
-                # Remove quotes and empty lines
-                prompts["stage1"] = [line.strip().strip('"') for line in f if line.strip()]
-
-        if os.path.exists(stage2_path):
-            with open(stage2_path, "r", encoding="utf-8") as f:
-                prompts["stage2"] = f.read().strip()
-
+        prompt_files = {
+            "final_json": "stage2.txt",
+            "evidence_trace": "evidence_trace.txt",
+            "taxonomy_classification": "taxonomy.txt",
+            "consistency_check": "consistency.txt",
+        }
+        for task_name, filename in prompt_files.items():
+            path = os.path.join(self.prompt_dir, filename)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    prompts[task_name] = handle.read().strip()
+            else:
+                if task_name == "final_json":
+                    fallback = os.path.join(self.prompt_dir, "stage2.txt")
+                    with open(fallback, "r", encoding="utf-8") as handle:
+                        prompts[task_name] = handle.read().strip()
+                else:
+                    prompts[task_name] = DEFAULT_PROMPTS[task_name]
         return prompts
 
     def __len__(self):
         return len(self.data)
 
-    def _format_step2_json(self, step2_draft):
-        """
-        Convert the dataset's step2_draft into the competition's strict schema.
-        Dataset schema: per_criterion_draft [{criterion, proposed_score, evidence}]
-        Competition schema: per_criterion [{criterion, evidence, aigc score}]
-        """
-        per_criterion = []
-        draft_list = step2_draft.get("per_criterion_draft", [])
-        
-        for d in draft_list:
-            per_criterion.append({
-                "criterion": d["criterion"],
-                "evidence": d["evidence"],
-                "aigc score": d.get("proposed_score", 0)
-            })
-        
-        return {
-            "per_criterion": per_criterion,
-            "overall_likelihood": step2_draft.get("overall_likelihood", "Uncertain")
-        }
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _pick_task(self, idx: int) -> str:
+        rng = random.Random(self.seed + self.epoch * 1_000_003 + idx)
+        return rng.choices(self.task_names, weights=self.task_probs, k=1)[0]
+
+    def _load_image(self, path: str) -> Image.Image:
+        try:
+            image = Image.open(path).convert("RGB")
+            image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+            return image
+        except Exception:
+            return Image.new("RGB", (224, 224), color=(0, 0, 0))
+
+    def _build_prompt_and_target(self, item: Dict[str, object], task_name: str):
+        final_json_text = json_dumps(item["final_json_target"])
+        evidence_trace_text = json_dumps(item["evidence_trace_target"])
+        taxonomy_text = json_dumps(item["taxonomy_target"])
+        consistency_text = json_dumps(item["consistency_target"])
+
+        if task_name == "evidence_trace":
+            return self.prompts["evidence_trace"], evidence_trace_text
+        if task_name == "taxonomy_classification":
+            return self.prompts["taxonomy_classification"], taxonomy_text
+        if task_name == "consistency_check":
+            return self.prompts["consistency_check"], consistency_text
+
+        user_prompt = (
+            f"{self.prompts['final_json']}\n\n"
+            "Here is the structured evidence trace for this image:\n"
+            f"{evidence_trace_text}\n\n"
+            "Use the trace to synthesize the final competition JSON."
+        )
+        return user_prompt, final_json_text
+
+    def _tokenize_messages(self, messages):
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            add_generation_prompt=False,
+        )
+        labels = inputs["input_ids"].clone()
+        prompt_inputs = self.processor.apply_chat_template(
+            messages[:-1],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        prompt_length = len(prompt_inputs)
+        labels[0, :prompt_length] = -100
+        inputs["labels"] = labels
+        return inputs
 
     def __getitem__(self, idx):
         item = self.data[idx]
-
-        try:
-            image = Image.open(item["full_image_path"]).convert("RGB")
-            # 限制解析度
-            image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-        except Exception as e:
-            # print(f"Error loading image {item['full_image_path']}: {e}")
-            image = Image.new("RGB", (224, 224), color=(0, 0, 0))
-
-        # Multi-task sampling: 50% Stage 1 (Analysis), 50% Stage 2 (JSON)
-        # We can adjust this ratio.
-        task_type = random.choice(["stage1", "stage2"])
-        
-        if task_type == "stage1" and self.prompts.get("stage1"):
-            # Stage 1: Detailed analysis based on one of the prompts
-            user_prompt = random.choice(self.prompts["stage1"])
-            # Use original_response as the gold standard analysis
-            target_text = item.get("original_response", "")
-        else:
-            # Stage 2: Synthesis into JSON
-            stage2_template = self.prompts.get("stage2", "")
-            excerpts = item.get("original_response", "")
-            user_prompt = f"{stage2_template}\n\nHere are the analytical answers:\n{excerpts}"
-            
-            # Use step2_draft transformed to correct schema
-            step2_data = item.get("step2_draft", {})
-            formatted_json = self._format_step2_json(step2_data)
-            target_text = json.dumps(formatted_json, ensure_ascii=False)
+        task_name = self._pick_task(idx)
+        image = self._load_image(item["full_image_path"])
+        user_prompt, target_text = self._build_prompt_and_target(item, task_name)
 
         messages = [
             {
@@ -122,67 +227,51 @@ class HolmesSFTDataset(Dataset):
             {"role": "assistant", "content": [{"type": "text", "text": target_text}]},
         ]
 
-        if self.processor is not None:
-            try:
-                inputs = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                    add_generation_prompt=False,
-                )
-                
-                # --- 新增: Instruction Masking (只對 Assistant 回覆計算 Loss) ---
-                # 複製 input_ids 作為 labels
-                labels = inputs["input_ids"].clone()
-                
-                # 找到 Assistant 回覆開始的位置
-                # Qwen2 的 chat template 格式通常是 <|im_start|>assistant\n
-                # 我們可以透過尋找 assistant token 序列來屏蔽前面的部分
-                # 這裡提供一個通用的做法：
-                # 1. 建立只有 User 內容的 prompt
-                prompt_messages = messages[:-1]
-                prompt_inputs = self.processor.apply_chat_template(
-                    prompt_messages,
-                    tokenize=True,
-                    add_generation_prompt=True, # 包含 <|im_start|>assistant\n
-                )
-                prompt_length = len(prompt_inputs)
-                
-                # 將 User Prompt 區域的 labels 設為 -100
-                labels[0, :prompt_length] = -100
-                inputs["labels"] = labels
+        inputs = self._tokenize_messages(messages)
+        no_squeeze = {
+            "pixel_values",
+            "image_grid_thw",
+            "pixel_values_videos",
+            "video_grid_thw",
+        }
+        inputs_dict = {
+            key: (value if key in no_squeeze else value.squeeze(0))
+            for key, value in inputs.items()
+        }
 
-            except Exception as e:
-                # print(f"Error in apply_chat_template: {e}")
-                prompt = f"<|image|>\nUser: {user_prompt}\nAssistant: {target_text}"
-                inputs = self.processor(text=prompt, images=image, return_tensors="pt")
-                inputs["labels"] = inputs["input_ids"].clone()
-
-            no_squeeze = {
-                "pixel_values",
-                "image_grid_thw",
-                "pixel_values_videos",
-                "video_grid_thw",
-            }
-            inputs_dict = {
-                k: (v if k in no_squeeze else (v.squeeze(0) if v.dim() > 0 else v))
-                for k, v in inputs.items()
-            }
-            return inputs_dict
+        expert_target = self.expert_targets.get(str(item["image"]))
+        if expert_target:
+            inputs_dict["expert_overall_prob"] = expert_target["expert_overall_prob"]
+            inputs_dict["expert_criterion_probs"] = expert_target["expert_criterion_probs"]
+            inputs_dict["expert_target_mask"] = torch.tensor([1.0], dtype=torch.float32)
         else:
-            return {"messages": messages, "image": image}
+            inputs_dict["expert_overall_prob"] = torch.zeros(1, dtype=torch.float32)
+            inputs_dict["expert_criterion_probs"] = torch.zeros(len(CRITERIA), dtype=torch.float32)
+            inputs_dict["expert_target_mask"] = torch.tensor([0.0], dtype=torch.float32)
+
+        inputs_dict["task_name"] = task_name
+        inputs_dict["row_id"] = torch.tensor(int(item.get("row_id", idx)), dtype=torch.long)
+        return inputs_dict
 
 
-def get_dataloader(
-    jsonl_path, prompt_dir, processor, batch_size=2, shuffle=True, num_workers=4
-):
-    dataset = HolmesSFTDataset(jsonl_path, prompt_dir, processor)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    return dataloader
+class LegacyHolmesSFTDataset(Dataset):
+    def __init__(self, jsonl_path, processor=None):
+        self.data = []
+        self.processor = processor
+        with open(jsonl_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    self.data.append(json.loads(line))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+HolmesSFTDataset = DerivedMultiTaskDataset
+
+
+def get_default_task_mix():
+    return dict(DEFAULT_TASK_MIX)

@@ -1,3 +1,9 @@
 __pycache__/
+*.pyc
 outputs/
 stage1_g31b_v5_full_balanced/
+.worktrees/
+.antigravitycli/
+student/experts/
+student/reports/
+teacher/derived_deterministic_v1/

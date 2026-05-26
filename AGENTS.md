@@ -26,6 +26,7 @@ The 8 fixed criteria are:
 
 - `prompts/stage1.txt`: three Stage 1 image-analysis prompts.
 - `prompts/stage2.txt`: Stage 2 synthesis prompt for strict JSON output.
+- `prompts/evidence_trace.txt`, `prompts/taxonomy.txt`, `prompts/consistency.txt`: multi-task prompts for the derived supervision pipeline.
 - `teacher/`: Holmes-to-LPCVC teacher-data conversion pipeline.
 - `student/`: Qwen VLM SFT training and inference pipeline.
 - `run_eda.py`, `eda_results.md`: lightweight dataset inspection utility and previous EDA output.
@@ -59,6 +60,22 @@ Current local generated dataset status:
 - labels: `16035 Real`, `16035 AI-Generated`
 - all `image` fields resolve relative to `teacher/stage1_g31b_v5_full_balanced/`
 - current rows use the generator-only schema: `step2_draft`, not full reviewed `step2_target`
+
+The deterministic derived dataset generated from the existing teacher labels is:
+
+```text
+teacher/derived_deterministic_v1/
+  derived.jsonl
+  manifest.json
+```
+
+Its rows keep the original `image` and `original_response`, and add:
+
+- `final_json_target`
+- `evidence_trace_target`
+- `taxonomy_target`
+- `consistency_target`
+- `quality_flags`
 
 There is also an external/generated dataset path used by defaults in the student code:
 
@@ -100,6 +117,12 @@ Main file:
 
 ```text
 teacher/convert_holmes_sft.py
+```
+
+Derived-data builder:
+
+```text
+teacher/build_derived_dataset.py
 ```
 
 Purpose:
@@ -150,6 +173,14 @@ python3 teacher/convert_holmes_sft.py \
   --overwrite-images
 ```
 
+Build the deterministic derived dataset without regenerating labels:
+
+```bash
+python3 teacher/build_derived_dataset.py \
+  --input-jsonl teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl \
+  --output-root teacher/derived_deterministic_v1
+```
+
 ## Student Training Pipeline
 
 Main files:
@@ -157,11 +188,16 @@ Main files:
 - `student/src/dataset.py`
 - `student/src/train.py`
 - `student/src/inference.py`
+- `student/src/evaluate.py`
+- `student/src/train_visual_expert.py`
+- `student/src/visual_expert.py`
 - `student/finetune.sh`
 
 Current student implementation:
 
-- Base model defaults in `train.py`: `Qwen/Qwen2-VL-2B-Instruct`.
+- Phase 1 backbone default: `Qwen/Qwen2.5-VL-3B-Instruct`.
+- Baseline-only legacy checkpoint: `student/outputs/20260427_105054/checkpoint-7014`.
+- Old LoRA adapters are for inference/evaluation baselines only; new Phase 1 runs start from the base model and create a fresh LoRA adapter.
 - Previous completed runs used `Qwen/Qwen2.5-VL-3B-Instruct`.
 - Training method: 4-bit QLoRA with PEFT LoRA adapters.
 - LoRA target modules: attention projections plus MLP projections.
@@ -174,12 +210,14 @@ Current student implementation:
 
 Dataset behavior:
 
-- If `--data_path` is a directory, training reads `holmes_lpcvc_sft.jsonl` inside it.
-- `image` is resolved relative to the dataset directory first.
-- Fallback image root is `/ssd4/LPCVC2026/dataset/holmes`.
-- Each sample randomly trains either:
-  - Stage 1 analysis, using one prompt from `stage1.txt` and `original_response` as target.
-  - Stage 2 JSON synthesis, using `stage2.txt` plus `original_response`, with `step2_draft` converted to the official `per_criterion` / `aigc score` format.
+- Primary input is the derived dataset: `teacher/derived_deterministic_v1/derived.jsonl`.
+- `image` is resolved via the row-level `image_root`, so the derived dataset does not need to copy images.
+- Each epoch re-samples one of four tasks per row using the configured task mix:
+  - `final_json`
+  - `evidence_trace`
+  - `taxonomy_classification`
+  - `consistency_check`
+- When `--visual_expert_path` points to `dataset_logits.jsonl`, training can add an auxiliary distillation loss through a lightweight pooled hidden-state head.
 
 Repo-relative training example:
 
@@ -187,12 +225,29 @@ Repo-relative training example:
 cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
   --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --data_path teacher/stage1_g31b_v5_full_balanced \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts \
   --output_dir student/outputs \
   --batch_size 2 \
   --epochs 3 \
-  --lr 1e-4
+  --lr 1e-4 \
+  --train_mode multitask_sft
+```
+
+Recommended Phase 1 task mix:
+
+```bash
+--task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
+```
+
+Baseline evaluation:
+
+```bash
+python3 student/src/evaluate.py \
+  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --adapter_path student/outputs/20260427_105054/checkpoint-7014 \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --prompt_dir prompts
 ```
 
 Using the wrapper script:
@@ -201,26 +256,95 @@ Using the wrapper script:
 cd /ssd4/LPCVC2026/Module-II-Final/student
 ./finetune.sh \
   --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --data_path /ssd4/LPCVC2026/Module-II-Final/teacher/stage1_g31b_v5_full_balanced \
+  --derived_data_path /ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir /ssd4/LPCVC2026/Module-II-Final/prompts \
   --output_dir /ssd4/LPCVC2026/Module-II-Final/student/outputs
 ```
 
-Inference script status:
+Resume semantics:
 
-- `student/src/inference.py` loads a base Qwen VL model plus a PEFT adapter.
-- Current paths are hard-coded in the script.
-- It runs the intended two-stage inference flow:
-  1. Generate three Stage 1 analyses from `stage1.txt`.
-  2. Concatenate analyses into the Stage 2 prompt and generate final JSON.
+- `--resume_from_checkpoint` only continues the same run after interruption.
+- Use `--run_name <existing_run> --resume_from_checkpoint True` to resume the latest checkpoint in that run directory.
+- To resume a specific checkpoint, pass its explicit `checkpoint-*` path.
+- Do not use `--resume_from_checkpoint` as a way to initialize a new run from an old adapter.
 
-Before using it on a different checkpoint or image, edit:
+Visual expert training:
 
-- `base_model_name`
-- `adapter_path`
-- `image_path`
-- `val_stage1_path`
-- `val_stage2_path`
+```bash
+python3 student/src/train_visual_expert.py \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --output_dir student/experts/default
+```
+
+Phase 1 distillation round:
+
+```bash
+python3 student/src/train.py \
+  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --prompt_dir prompts \
+  --output_dir student/outputs \
+  --train_mode multitask_sft \
+  --task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}' \
+  --visual_expert_path student/experts/default/dataset_logits.jsonl \
+  --distill_weight 0.1 \
+  --batch_size 2 \
+  --epochs 3 \
+  --lr 1e-4
+```
+
+Inference CLI:
+
+```bash
+python3 student/src/inference.py \
+  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --image_path <image> \
+  --prompt_dir prompts \
+  --expert_path student/experts/default/expert.pt
+```
+
+Evaluation CLI:
+
+```bash
+python3 student/src/evaluate.py \
+  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --prompt_dir prompts
+```
+
+## Phase 1 TODO
+
+Status legend:
+
+- `[x]` completed
+- `[-]` in progress
+- `[ ]` pending
+
+Execution checklist:
+
+- `[x]` Deterministic derived dataset builder implemented and dataset materialized at `teacher/derived_deterministic_v1/derived.jsonl`
+- `[x]` Multi-task student pipeline implemented for `final_json`, `evidence_trace`, `taxonomy_classification`, `consistency_check`
+- `[x]` Visual expert training and distillation hooks implemented
+- `[x]` Baseline backbone fixed to `Qwen/Qwen2.5-VL-3B-Instruct`
+- `[x]` Best legacy baseline checkpoint fixed to `student/outputs/20260427_105054/checkpoint-7014`
+- `[x]` `resume_from_checkpoint` semantics corrected to mean same-run continuation only
+- `[x]` Training, inference, and evaluation CLI smoke-tested
+- `[x]` Run baseline evaluation smoke slice for `checkpoint-7014` and confirm the evaluation path is wired end to end
+- `[x]` Train full visual expert and write `expert.pt`, `dataset_logits.jsonl`, `metadata.json`
+- `[-]` Run Phase 1 round 1 multi-task SFT from base model with no distillation (`student/outputs/phase1_round1_20260526`, GPU 1)
+- `[ ]` Evaluate Phase 1 round 1 checkpoint against the legacy baseline
+- `[ ]` Run Phase 1 round 2 multi-task SFT with visual expert distillation (`distill_weight=0.1`)
+- `[ ]` Evaluate Phase 1 round 2 checkpoint and compare against baseline + round 1
+- `[ ]` Select the best Phase 1 checkpoint for downstream inference and further optimization
+
+Current working assumptions:
+
+- Old LoRA adapters are never used as initialization for new multi-task runs.
+- Baseline evaluation and later comparisons use the same derived dataset and prompt set.
+- The current long-running step is round 1 multi-task SFT from the base model without distillation.
+- `student/src/evaluate.py` is functionally correct after malformed-trace hardening, but its current throughput is too slow for large comparison slices; use sample-based reports first.
 
 ## Prompt Flow
 
@@ -277,10 +401,10 @@ PY
 ## Known Gaps
 
 - ONNX export, AIMET quantization, AI Hub compile, and final mobile validation are not implemented in this repo yet.
-- `student/src/inference.py` is a fixed-path smoke-test script rather than a CLI.
+- Full-dataset evaluation is currently expensive because the pipeline performs two generations per sample plus the optional probes.
 - `student/finetune.sh` carries environment-specific absolute defaults. Override paths when running from this repository.
 - Current local teacher dataset is generator-only. Run `full` or `review_only` if reviewed `step2_target` supervision is required.
-- Teacher and student defaults are not identical: `train.py` defaults to Qwen2-VL-2B, while previous run summaries used Qwen2.5-VL-3B.
+- The current Phase 1 default backbone is `Qwen/Qwen2.5-VL-3B-Instruct`; older historical runs in `student/outputs/` include other backbones and should not be treated as current defaults.
 
 ## Editing Guidance
 

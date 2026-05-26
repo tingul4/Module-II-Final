@@ -1,0 +1,20 @@
+TASK:
+Analyze the image and return ONLY a JSON object judging whether the expected LPCVC score for each criterion is consistent with its evidence.
+
+OUTPUT SCHEMA:
+{
+  "overall_consistent": true or false,
+  "expected_overall_likelihood": "Real" | "AI-Generated",
+  "per_criterion": [
+    {
+      "criterion": "Lighting & Shadows Consistency",
+      "consistent": true or false,
+      "reason": "..."
+    }
+  ]
+}
+
+RULES:
+- Return all 8 criteria in the official order.
+- Mark consistent=false when a positive score would lack grounded artifact evidence.
+- Output JSON only.

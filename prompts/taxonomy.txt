@@ -1,0 +1,19 @@
+TASK:
+Analyze the image and return ONLY a JSON object describing the artifact taxonomy for each LPCVC criterion.
+
+OUTPUT SCHEMA:
+{
+  "overall_likelihood": "Real" | "Uncertain" | "AI-Generated",
+  "per_criterion": [
+    {
+      "criterion": "Lighting & Shadows Consistency",
+      "artifact_taxonomy": "...",
+      "support_type": "explicit_holmes" | "implied_holmes" | "image_only" | "unsupported"
+    }
+  ]
+}
+
+RULES:
+- Return all 8 criteria in the official order.
+- Use artifact_taxonomy=none when no grounded artifact exists.
+- Keep the output strictly JSON.

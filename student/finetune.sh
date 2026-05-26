@@ -3,13 +3,16 @@ export CUDA_VISIBLE_DEVICES=0
 
 # Default Training Arguments
 TRAIN_ARGS=(
-  --model_name_or_path Qwen/Qwen2-VL-2B-Instruct
-  --data_path /ssd4/LPCVC2026/holmes_lpcvc3_multi_teacher/stage1_g31b_v5_full_balanced
+  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct
+  --derived_data_path /ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl
+  --prompt_dir /ssd4/LPCVC2026/Module-II-Final/prompts
+  --output_dir /ssd4/LPCVC2026/Module-II-Final/student/outputs
+  --train_mode multitask_sft
   --batch_size 4
   --epochs 10
 )
 
 # Run training. 
 # You can override or add arguments by passing them to this script, 
-# e.g., ./finetune.sh --eval_steps 100 --lr 5e-5
-conda run --no-capture-output -n base python3 /ssd4/LPCVC2026/student/src/train.py "${TRAIN_ARGS[@]}" "$@"
+# e.g., ./finetune.sh --batch_size 2 --lr 5e-5
+conda run --no-capture-output -n base python3 /ssd4/LPCVC2026/Module-II-Final/student/src/train.py "${TRAIN_ARGS[@]}" "$@"
