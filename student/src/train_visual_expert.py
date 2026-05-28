@@ -5,16 +5,16 @@ from visual_expert import train_visual_expert
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train lightweight visual expert for LPCVC derived dataset.")
+    parser = argparse.ArgumentParser(description="Train a lightweight visual expert for the Holmes-derived authenticity dataset.")
     parser.add_argument(
         "--derived_data_path",
         type=Path,
-        default=Path("/ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl"),
+        default=Path(__file__).resolve().parents[2] / "teacher" / "derived_deterministic_v1" / "derived.jsonl",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("/ssd4/LPCVC2026/Module-II-Final/student/experts/default"),
+        default=Path(__file__).resolve().parents[1] / "experts" / "default",
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)

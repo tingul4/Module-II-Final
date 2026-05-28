@@ -1,5 +1,5 @@
 TASK:
-Analyze the image and return ONLY a JSON object describing the artifact taxonomy for each LPCVC criterion.
+Analyze the image and return ONLY a JSON object describing the artifact taxonomy for each canonical criterion.
 
 OUTPUT SCHEMA:
 {

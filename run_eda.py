@@ -1,106 +1,104 @@
+import argparse
 import json
 import os
-from PIL import Image
+from pathlib import Path
+
 import numpy as np
+from PIL import Image
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run lightweight EDA on a Holmes-derived authenticity dataset JSONL.")
+    parser.add_argument(
+        "--jsonl_path",
+        type=Path,
+        default=REPO_ROOT / "teacher" / "stage1_g31b_v5_full_balanced" / "holmes_lpcvc_sft.jsonl",
+    )
+    parser.add_argument("--base_dir", type=Path, default=None)
+    parser.add_argument("--output_file", type=Path, default=REPO_ROOT / "eda_results.md")
+    return parser.parse_args()
+
+
+def resolve_image_path(base_dir: Path, item: dict) -> Path:
+    image_value = item.get("image") or item.get("full_image_path", "")
+    image_path = Path(str(image_value))
+    if image_path.is_absolute() and image_path.exists():
+        return image_path
+    candidate = base_dir / image_path
+    if candidate.exists():
+        return candidate
+    return candidate
 
 
 def main():
-    jsonl_path = "/ssd4/LPCVC2026/holmes_lpcvc3_multi_teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl"
-    base_dir = (
-        "/ssd4/LPCVC2026/holmes_lpcvc3_multi_teacher/stage1_g31b_v5_full_balanced"
-    )
+    args = parse_args()
+    base_dir = args.base_dir or args.jsonl_path.parent
 
     resolutions = []
     aspect_ratios = []
     text_lengths = []
     images_not_found = 0
 
-    print("Starting EDA...")
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
+    print(f"Starting EDA for {args.jsonl_path} ...")
+    with args.jsonl_path.open("r", encoding="utf-8") as handle:
+        for idx, line in enumerate(handle):
             item = json.loads(line)
-            # 支援不同鍵值的寫法
-            img_val = item.get("image") or item.get("full_image_path", "")
-            img_path = str(img_val)
+            image_path = resolve_image_path(base_dir, item)
 
-            # 若為相對路徑，轉換為絕對路徑
-            if not os.path.exists(img_path):
-                img_path = os.path.join(base_dir, img_path)
-
-            if os.path.exists(img_path):
+            if image_path.exists():
                 try:
-                    with Image.open(img_path) as img:
-                        w, h = img.size
-                        resolutions.append(w * h)
-                        aspect_ratios.append(w / h)
+                    with Image.open(image_path) as image:
+                        width, height = image.size
+                        resolutions.append(width * height)
+                        aspect_ratios.append(width / height)
                 except Exception:
                     pass
-            elif img_path:
-                img_path = os.path.join("/ssd4/LPCVC2026/dataset", img_val)
-                if os.path.exists(img_path):
-                    try:
-                        with Image.open(img_path) as img:
-                            w, h = img.size
-                            resolutions.append(w * h)
-                            aspect_ratios.append(w / h)
-                    except Exception:
-                        pass
-                else:
-                    images_not_found += 1
+            else:
+                images_not_found += 1
 
-            # Text length (包含 step1_target, step2_target 或是 original_response)
-            target = item.get(
-                "step1_target",
-                item.get("step2_target", item.get("original_response", "")),
-            )
-            text_str = (
-                target
-                if isinstance(target, str)
-                else json.dumps(target, ensure_ascii=False)
-            )
+            target = item.get("step1_target", item.get("step2_target", item.get("original_response", "")))
+            text_str = target if isinstance(target, str) else json.dumps(target, ensure_ascii=False)
             text_lengths.append(len(text_str))
 
-            if i > 0 and i % 5000 == 0:
-                print(f"Processed {i} items")
+            if idx > 0 and idx % 5000 == 0:
+                print(f"Processed {idx} items")
 
-    # 統整結果並輸出成 Markdown 格式
-    res = []
-    res.append("# Dataset Exploratory Data Analysis (EDA)")
-    res.append("\n## Source")
-    res.append(f"- **Dataset**: `{jsonl_path}`")
+    results = []
+    results.append("# Dataset Exploratory Data Analysis (EDA)")
+    results.append("\n## Source")
+    results.append(f"- **Dataset**: `{args.jsonl_path}`")
 
-    res.append("\n## Image Analysis")
-    res.append(f"- **Total valid images analyzed**: {len(resolutions)}")
-    res.append(f"- **Images not found**: {images_not_found}")
+    results.append("\n## Image Analysis")
+    results.append(f"- **Total valid images analyzed**: {len(resolutions)}")
+    results.append(f"- **Images not found**: {images_not_found}")
 
     if resolutions:
-        res.append(f"- **Image Resolution (Pixels)**:")
-        res.append(f"  - Mean: {np.mean(resolutions):.0f}")
-        res.append(f"  - Median: {np.percentile(resolutions, 50):.0f}")
-        res.append(f"  - Max: {np.max(resolutions)}")
-        res.append(f"  - Min: {np.min(resolutions)}")
-        res.append(f"- **Aspect Ratio (W/H)**:")
-        res.append(f"  - Mean: {np.mean(aspect_ratios):.2f}")
-        res.append(f"  - Max: {np.max(aspect_ratios):.2f}")
-        res.append(f"  - Min: {np.min(aspect_ratios):.2f}")
+        results.append("- **Image Resolution (Pixels)**:")
+        results.append(f"  - Mean: {np.mean(resolutions):.0f}")
+        results.append(f"  - Median: {np.percentile(resolutions, 50):.0f}")
+        results.append(f"  - Max: {np.max(resolutions)}")
+        results.append(f"  - Min: {np.min(resolutions)}")
+        results.append("- **Aspect Ratio (W/H)**:")
+        results.append(f"  - Mean: {np.mean(aspect_ratios):.2f}")
+        results.append(f"  - Max: {np.max(aspect_ratios):.2f}")
+        results.append(f"  - Min: {np.min(aspect_ratios):.2f}")
 
-    res.append("\n## Text Target Analysis")
-    res.append(f"- **Text target length (characters)**:")
-    res.append(f"  - Mean: {np.mean(text_lengths):.1f}")
-    res.append(f"  - Max: {np.max(text_lengths)}")
-    res.append(f"  - Min: {np.min(text_lengths)}")
-    res.append("- **Text length percentiles**:")
-    res.append(f"  - 50%: {np.percentile(text_lengths, 50)}")
-    res.append(f"  - 90%: {np.percentile(text_lengths, 90)}")
-    res.append(f"  - 99%: {np.percentile(text_lengths, 99)}")
+    if text_lengths:
+        results.append("\n## Text Target Analysis")
+        results.append("- **Text target length (characters)**:")
+        results.append(f"  - Mean: {np.mean(text_lengths):.1f}")
+        results.append(f"  - Max: {np.max(text_lengths)}")
+        results.append(f"  - Min: {np.min(text_lengths)}")
+        results.append("- **Text length percentiles**:")
+        results.append(f"  - 50%: {np.percentile(text_lengths, 50)}")
+        results.append(f"  - 90%: {np.percentile(text_lengths, 90)}")
+        results.append(f"  - 99%: {np.percentile(text_lengths, 99)}")
 
-    md_content = "\n".join(res)
-
-    output_file = "/ssd4/LPCVC2026/student/eda_results.md"
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(md_content)
-
-    print(f"\nEDA complete! Results saved to {output_file}")
+    args.output_file.write_text("\n".join(results), encoding="utf-8")
+    print(f"\nEDA complete. Results saved to {args.output_file}")
 
 
 if __name__ == "__main__":

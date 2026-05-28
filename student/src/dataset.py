@@ -9,9 +9,10 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from lpcvc_utils import (
+from task_utils import (
     CRITERIA,
-    DEFAULT_EVIDENCE,
+    compact_json_dumps,
+    compact_trace_payload,
     json_dumps,
 )
 
@@ -46,12 +47,12 @@ DEFAULT_PROMPTS = {
         f"Use these exact criteria in order: {', '.join(CRITERIA)}."
     ),
     "taxonomy_classification": (
-        "Analyze the image and return ONLY a JSON object that lists the exact LPCVC criteria in order.\n"
+        "Analyze the image and return ONLY a JSON object that lists the exact canonical criteria in order.\n"
         'For each criterion output {"criterion": "...", "artifact_taxonomy": "...", "support_type": "..."}.\n'
         "Use artifact_taxonomy=none when no grounded artifact is visible."
     ),
     "consistency_check": (
-        "Analyze the image and return ONLY a JSON object assessing whether each LPCVC criterion would have a score"
+        "Analyze the image and return ONLY a JSON object assessing whether each canonical criterion would have a score"
         ' that is consistent with its evidence. Use the schema {"overall_consistent": true/false, '
         '"expected_overall_likelihood": "Real" | "AI-Generated", '
         '"per_criterion": [{"criterion": "...", "consistent": true/false, "reason": "..."}]}.'
@@ -68,6 +69,8 @@ class DerivedMultiTaskDataset(Dataset):
         max_length=2048,
         task_mix: Optional[Dict[str, float]] = None,
         expert_targets_path: Optional[str] = None,
+        trace_evidence_words: int = 14,
+        trace_holmes_span_words: int = 12,
         seed: int = 42,
     ):
         self.data = []
@@ -77,6 +80,8 @@ class DerivedMultiTaskDataset(Dataset):
         self.max_length = max_length
         self.prompt_dir = prompt_dir
         self.task_mix = task_mix or dict(DEFAULT_TASK_MIX)
+        self.trace_evidence_words = int(trace_evidence_words)
+        self.trace_holmes_span_words = int(trace_holmes_span_words)
         self.task_names = list(self.task_mix.keys())
         self.task_probs = self._normalize_task_mix(self.task_mix)
         self.prompts = self._load_prompts()
@@ -172,7 +177,12 @@ class DerivedMultiTaskDataset(Dataset):
 
     def _build_prompt_and_target(self, item: Dict[str, object], task_name: str):
         final_json_text = json_dumps(item["final_json_target"])
-        evidence_trace_text = json_dumps(item["evidence_trace_target"])
+        compact_trace = compact_trace_payload(
+            item["evidence_trace_target"],
+            evidence_words=self.trace_evidence_words,
+            holmes_span_words=self.trace_holmes_span_words,
+        )
+        evidence_trace_text = compact_json_dumps(compact_trace)
         taxonomy_text = json_dumps(item["taxonomy_target"])
         consistency_text = json_dumps(item["consistency_target"])
 
@@ -187,7 +197,7 @@ class DerivedMultiTaskDataset(Dataset):
             f"{self.prompts['final_json']}\n\n"
             "Here is the structured evidence trace for this image:\n"
             f"{evidence_trace_text}\n\n"
-            "Use the trace to synthesize the final competition JSON."
+            "Use the trace to synthesize the final structured decision JSON."
         )
         return user_prompt, final_json_text
 

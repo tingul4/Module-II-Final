@@ -6,4 +6,6 @@ stage1_g31b_v5_full_balanced/
 .antigravitycli/
 student/experts/
 student/reports/
+student/merged_models/
+student/mobile_artifacts/
 teacher/derived_deterministic_v1/

@@ -5,25 +5,79 @@ from pathlib import Path
 
 from PIL import Image
 
-from inference import apply_expert_fusion, generate_text, load_model, load_prompts
-from lpcvc_utils import CRITERIA, json_dumps, safe_json_loads
+from inference import apply_expert_fusion, generate_text, generate_trace_payload, load_model, load_prompts
+from task_utils import CRITERIA, compact_json_dumps, compact_trace_payload, safe_json_loads
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate multitask LPCVC student model.")
-    parser.add_argument("--base_model", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Evaluate a multitask image-authenticity student model.")
+    parser.add_argument("--base_model", type=str, default="google/gemma-4-E2B-it")
     parser.add_argument("--adapter_path", type=str, required=True)
     parser.add_argument("--derived_data_path", type=str, required=True)
-    parser.add_argument("--prompt_dir", type=str, default="/ssd4/LPCVC2026/Module-II-Final/prompts")
+    parser.add_argument("--prompt_dir", type=str, default=str(REPO_ROOT / "prompts"))
     parser.add_argument("--expert_path", type=str, default=None)
     parser.add_argument("--fusion_alpha", type=float, default=0.8)
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--probe_samples", type=int, default=50)
-    parser.add_argument("--max_new_tokens_trace", type=int, default=1024)
+    parser.add_argument("--max_new_tokens_trace", type=int, default=1536)
     parser.add_argument("--max_new_tokens_json", type=int, default=1024)
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--output_path", type=str, default=None)
     return parser.parse_args()
+
+
+def render_html_report(title: str, report: dict, output_path: Path):
+    rows = []
+    for criterion, metrics in report.get("per_criterion_f1", {}).items():
+        rows.append(
+            "<tr>"
+            f"<td>{criterion}</td>"
+            f"<td>{metrics.get('precision', 0.0):.3f}</td>"
+            f"<td>{metrics.get('recall', 0.0):.3f}</td>"
+            f"<td>{metrics.get('f1', 0.0):.3f}</td>"
+            "</tr>"
+        )
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #111; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
+    th, td {{ border: 1px solid #ccc; padding: 8px 10px; text-align: left; }}
+    th {{ background: #f5f5f5; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; }}
+    .metric {{ border: 1px solid #ddd; padding: 12px; }}
+    .value {{ font-size: 24px; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class="metrics">
+    <div class="metric"><div>Final JSON Parse</div><div class="value">{report.get('json_parse_rate', 0.0):.3f}</div></div>
+    <div class="metric"><div>Trace JSON Parse</div><div class="value">{report.get('trace_json_parse_rate', 0.0):.3f}</div></div>
+    <div class="metric"><div>Overall Accuracy</div><div class="value">{report.get('overall_accuracy', 0.0):.3f}</div></div>
+    <div class="metric"><div>Macro F1</div><div class="value">{report.get('macro_f1', 0.0):.3f}</div></div>
+    <div class="metric"><div>Support Type Accuracy</div><div class="value">{report.get('support_type_accuracy', 0.0):.3f}</div></div>
+    <div class="metric"><div>Taxonomy Accuracy</div><div class="value">{report.get('taxonomy_accuracy', 0.0):.3f}</div></div>
+    <div class="metric"><div>Consistency Score</div><div class="value">{report.get('consistency_score', 0.0):.3f}</div></div>
+    <div class="metric"><div>Real False Positive Rate</div><div class="value">{report.get('real_false_positive_rate', 0.0):.3f}</div></div>
+    <div class="metric"><div>Blank Probe Parse</div><div class="value">{report.get('blank_probe', {}).get('json_parse_rate', 0.0):.3f}</div></div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Criterion</th><th>Precision</th><th>Recall</th><th>F1</th></tr>
+    </thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</body>
+</html>
+"""
+    output_path.write_text(html, encoding="utf-8")
 
 
 def iter_rows(path: Path):
@@ -89,6 +143,7 @@ def evaluate_prediction(pred: dict, gold: dict, counts: dict):
 def evaluate_trace_prediction(pred: dict, gold: dict, counts: dict):
     if not pred:
         return
+    counts["trace_json_parse_ok"] += 1
     pred_entries = normalize_criterion_entries(pred)
     for gold_entry in gold.get("per_criterion", []):
         pred_entry = pred_entries.get(gold_entry["criterion"], {})
@@ -124,6 +179,7 @@ def finalize_metrics(counts: dict):
         macro_f1_values.append(f1)
     return {
         "json_parse_rate": counts["json_parse_ok"] / counts["samples"] if counts["samples"] else 0.0,
+        "trace_json_parse_rate": counts["trace_json_parse_ok"] / counts["samples"] if counts["samples"] else 0.0,
         "overall_accuracy": counts["overall_correct"] / counts["samples"] if counts["samples"] else 0.0,
         "macro_f1": sum(macro_f1_values) / len(macro_f1_values) if macro_f1_values else 0.0,
         "per_criterion_f1": per_criterion_f1,
@@ -143,6 +199,7 @@ def main():
     counts = {
         "samples": 0,
         "json_parse_ok": 0,
+        "trace_json_parse_ok": 0,
         "overall_correct": 0,
         "tp": {criterion: 0 for criterion in CRITERIA},
         "fp": {criterion: 0 for criterion in CRITERIA},
@@ -167,13 +224,18 @@ def main():
         shuffled_rows = rows[1:] + rows[:1]
         for idx, row in enumerate(rows):
             image_path = resolve_image_path(dataset_path, row)
-            trace_text = generate_text(model, processor, image_path, evidence_trace_prompt, args.max_new_tokens_trace)
-            trace_json, _ = safe_json_loads(trace_text)
+            trace_text, trace_json, _, trace_for_final, _ = generate_trace_payload(
+                model,
+                processor,
+                image_path,
+                evidence_trace_prompt,
+                args.max_new_tokens_trace,
+            )
             final_prompt = (
                 f"{final_json_prompt}\n\n"
                 "Here is the structured evidence trace for this image:\n"
-                f"{trace_text}\n\n"
-                "Use the trace to synthesize the final competition JSON."
+                f"{trace_for_final}\n\n"
+                "Use the trace to synthesize the final structured decision JSON."
             )
             final_text = generate_text(model, processor, image_path, final_prompt, args.max_new_tokens_json)
             pred_json, _ = safe_json_loads(final_text)
@@ -183,14 +245,18 @@ def main():
             evaluate_trace_prediction(trace_json, row["evidence_trace_target"], counts)
 
             if idx < args.probe_samples:
-                blank_trace = generate_text(
-                    model, processor, handle.name, evidence_trace_prompt, args.max_new_tokens_trace
+                blank_trace, blank_trace_json, _, blank_trace_for_final, _ = generate_trace_payload(
+                    model,
+                    processor,
+                    handle.name,
+                    evidence_trace_prompt,
+                    args.max_new_tokens_trace,
                 )
                 blank_final = generate_text(
                     model,
                     processor,
                     handle.name,
-                    f"{final_json_prompt}\n\nHere is the structured evidence trace for this image:\n{blank_trace}",
+                    f"{final_json_prompt}\n\nHere is the structured evidence trace for this image:\n{blank_trace_for_final}\n\nUse the trace to synthesize the final structured decision JSON.",
                     args.max_new_tokens_json,
                 )
                 blank_json, _ = safe_json_loads(blank_final)
@@ -202,14 +268,18 @@ def main():
 
                 shuffle_row = shuffled_rows[idx]
                 shuffle_image_path = resolve_image_path(dataset_path, shuffle_row)
-                shuffle_trace = generate_text(
-                    model, processor, shuffle_image_path, evidence_trace_prompt, args.max_new_tokens_trace
+                shuffle_trace, shuffle_trace_json, _, shuffle_trace_for_final, _ = generate_trace_payload(
+                    model,
+                    processor,
+                    shuffle_image_path,
+                    evidence_trace_prompt,
+                    args.max_new_tokens_trace,
                 )
                 shuffle_final = generate_text(
                     model,
                     processor,
                     shuffle_image_path,
-                    f"{final_json_prompt}\n\nHere is the structured evidence trace for this image:\n{shuffle_trace}",
+                    f"{final_json_prompt}\n\nHere is the structured evidence trace for this image:\n{shuffle_trace_for_final}\n\nUse the trace to synthesize the final structured decision JSON.",
                     args.max_new_tokens_json,
                 )
                 shuffle_json, _ = safe_json_loads(shuffle_final)
@@ -225,8 +295,8 @@ def main():
                     (
                         f"{final_json_prompt}\n\n"
                         "Here is the structured evidence trace for this image:\n"
-                        f"{json_dumps(row['evidence_trace_target'])}\n\n"
-                        "Use the trace to synthesize the final competition JSON."
+                        f"{compact_json_dumps(compact_trace_payload(row['evidence_trace_target']))}\n\n"
+                        "Use the trace to synthesize the final structured decision JSON."
                     ),
                     args.max_new_tokens_json,
                 )
@@ -261,7 +331,10 @@ def main():
 
     output = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output_path:
-        Path(args.output_path).write_text(output, encoding="utf-8")
+        output_path = Path(args.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output, encoding="utf-8")
+        render_html_report(output_path.stem, report, output_path.with_suffix(".html"))
     print(output)
 
 

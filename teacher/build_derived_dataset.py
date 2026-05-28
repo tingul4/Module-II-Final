@@ -9,10 +9,10 @@ from typing import Dict, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(REPO_ROOT / "student" / "src"))
 
-from lpcvc_utils import (
+from task_utils import (
     consistency_target_from_trace,
     evidence_trace_from_step2,
-    format_competition_json,
+    format_final_prediction_json,
     json_dumps,
     quality_flags_from_trace,
     taxonomy_target_from_trace,
@@ -20,16 +20,16 @@ from lpcvc_utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build deterministic derived dataset from existing teacher labels.")
+    parser = argparse.ArgumentParser(description="Build deterministic multitask supervision from existing Holmes-derived teacher labels.")
     parser.add_argument(
         "--input-jsonl",
         type=Path,
-        default=Path("/ssd4/LPCVC2026/Module-II-Final/teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl"),
+        default=REPO_ROOT / "teacher" / "stage1_g31b_v5_full_balanced" / "holmes_lpcvc_sft.jsonl",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1"),
+        default=REPO_ROOT / "teacher" / "derived_deterministic_v1",
     )
     return parser.parse_args()
 
@@ -58,7 +58,7 @@ def main() -> int:
     with derived_path.open("w", encoding="utf-8") as out_handle:
         for row_id, row in enumerate(iter_rows(args.input_jsonl)):
             step2_draft = row.get("step2_draft", {})
-            final_json_target = format_competition_json(step2_draft)
+            final_json_target = format_final_prediction_json(step2_draft)
             evidence_trace_target = evidence_trace_from_step2(step2_draft)
             taxonomy_target = taxonomy_target_from_trace(evidence_trace_target)
             consistency_target = consistency_target_from_trace(evidence_trace_target)

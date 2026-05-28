@@ -1,5 +1,5 @@
 TASK:
-Analyze the image and return ONLY a JSON object judging whether the expected LPCVC score for each criterion is consistent with its evidence.
+Analyze the image and return ONLY a JSON object judging whether the expected score for each canonical criterion is consistent with its evidence.
 
 OUTPUT SCHEMA:
 {

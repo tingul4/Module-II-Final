@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from lpcvc_utils import CRITERIA, FAKE_LABEL
+from task_utils import CRITERIA, FAKE_LABEL
 
 
 def _safe_corrcoef(x: np.ndarray, y: np.ndarray) -> float:

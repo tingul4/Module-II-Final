@@ -3,7 +3,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 # Default Training Arguments
 TRAIN_ARGS=(
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct
+  --model_name_or_path google/gemma-4-E2B-it
   --derived_data_path /ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl
   --prompt_dir /ssd4/LPCVC2026/Module-II-Final/prompts
   --output_dir /ssd4/LPCVC2026/Module-II-Final/student/outputs

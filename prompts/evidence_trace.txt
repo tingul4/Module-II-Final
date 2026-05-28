@@ -18,8 +18,12 @@ Analyze the image and return ONLY a JSON object with the exact schema below.
 }
 
 STRICT RULES:
-- Return all 8 LPCVC criteria in the exact official order.
+- Return all 8 canonical criteria in the exact official order.
 - score=1 only when the evidence explicitly describes a grounded artifact.
 - score=0 when no grounded artifact is visible or the criterion is not applicable.
 - Use support_type=unsupported when no grounded evidence exists.
+- Keep `evidence` short: at most 14 words, one sentence fragment only.
+- Keep `holmes_span` short: at most 12 words, no extra explanation.
+- Do not repeat the same claim across multiple criteria unless strictly necessary.
+- Prefer compact JSON formatting; whitespace is unnecessary.
 - Output JSON only.

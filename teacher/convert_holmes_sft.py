@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Holmes SFT supervision into LPCVC3-style JSONL targets."""
+"""Convert Holmes SFT supervision into canonical 8-criterion authenticity JSONL targets."""
 
 from __future__ import annotations
 
@@ -98,15 +98,15 @@ SOURCE_NAME = "holmes_sft"
 REAL_LABEL = "Real"
 FAKE_LABEL = "AI-Generated"
 GENERATOR_SYSTEM_PROMPT = (
-    "You convert Holmes explanations into structured LPCVC draft supervision. "
+    "You convert Holmes explanations into structured canonical-criteria draft supervision. "
     "This is a Holmes-first rewrite task, not a free re-judging task. Return JSON only."
 )
 JUDGE_SYSTEM_PROMPT = (
-    "You are the quality-control judge for Holmes-to-LPCVC conversion. "
+    "You are the quality-control judge for Holmes-to-canonical-criteria conversion. "
     "Review proposed criterion evidence conservatively and return JSON only."
 )
 SPECIALIST_SYSTEM_PROMPT = (
-    "You are a narrow specialist for a single LPCVC criterion. "
+    "You are a narrow specialist for a single canonical criterion. "
     "Answer only for the requested criterion and return JSON only."
 )
 DEBUG_RAW_OUTPUT_DIRNAME = "debug_raw_outputs"
@@ -546,16 +546,16 @@ def build_generator_prompt_v2(
         relaxed_rule = (
             f"\n10. Keep Holmes-first behavior for primary Holmes-aligned criteria: {primary_text}."
             f"\n11. For low-coverage but Holmes-strong criteria: {low_coverage_text}, Holmes remains preferred, but keep strong `image_only` candidates when Holmes is silent and the anomaly is visually concrete."
-            f"\n12. For LPCVC-added criteria: {lpcvc_added_text}, prefer preserving concrete `image_only` candidates over collapsing them to `unsupported`."
+            f"\n12. For authenticity-added criteria: {lpcvc_added_text}, prefer preserving concrete `image_only` candidates over collapsing them to `unsupported`."
             f"\n13. For hybrid criteria: {hybrid_text}, preserve image-based candidates when the physical or common-sense failure is specific and image-grounded."
         )
     return textwrap.dedent(
         f"""
-        Convert a Holmes explanation into LPCVC Track 3 draft supervision.
+        Convert a Holmes explanation into canonical 8-criterion draft supervision.
 
         Rules:
         1. Keep the label fixed at {record.label}.
-        2. First analyze all 8 LPCVC criteria internally, then output the final JSON only.
+        2. First analyze all 8 canonical criteria internally, then output the final JSON only.
         3. Holmes evidence is primary. `image_only` is candidate-only and not a final positive by itself.
         4. For each criterion, decide whether the strongest support is `explicit_holmes`, `implied_holmes`, `image_only`, or `unsupported`.
         5. `proposed_score = 1` means the criterion contains an AI artifact. `0` means no such artifact or not applicable.
@@ -564,7 +564,7 @@ def build_generator_prompt_v2(
         8. Return all 8 criteria in the exact order shown below.
         9. For Real images, do not add image_only positives.
         10. `step1_target` must be `Key points:` plus 2 to 3 short image-specific segments.
-        11. When Holmes is silent, relax `image_only` most for LPCVC-added criteria, moderately for Human/Bio and Physical/Common Sense, and least for primary Holmes-aligned criteria.
+        11. When Holmes is silent, relax `image_only` most for authenticity-added criteria, moderately for Human/Bio and Physical/Common Sense, and least for primary Holmes-aligned criteria.
         12. Use `Material & Object Details` for material and surface realism first: skin, scales, fur, fabric, finish, reflectance, smoothness, roughness, gloss, wear, grain, or repetitive surface detail. Color or saturation alone is weaker evidence unless it clearly supports a material/surface abnormality.
         13. Do not use `Material & Object Details` for geometry, edge quality, perspective, lighting/shadow inconsistency, text, or anatomy/limb structure. If another criterion is the better fit, keep the evidence there instead of duplicating it in Material.
         14. Return JSON only.
@@ -611,7 +611,7 @@ def build_judge_prompt(record: HolmesRecord, draft_entries: Sequence[Dict[str, o
     draft_json = json.dumps(slim_drafts, indent=2, ensure_ascii=True)
     return textwrap.dedent(
         f"""
-        Review Holmes-to-LPCVC draft entries for consistency.
+        Review Holmes-to-canonical-criteria draft entries for consistency.
 
         Rules:
         1. Keep the label fixed at {record.label}.
@@ -652,7 +652,7 @@ def build_specialist_prompt(record: HolmesRecord, criterion: str, draft_entry: D
 
     return textwrap.dedent(
         f"""
-        Review one LPCVC criterion only.
+        Review one canonical criterion only.
 
         Criterion: {criterion}
         Label: {record.label}
@@ -1287,7 +1287,7 @@ def build_heuristic_generator_output(
         )
 
     if not step1_segments:
-        step1_segments.append("Holmes explanation mapped into LPCVC criteria with fixed label supervision.")
+        step1_segments.append("Holmes explanation mapped into canonical criteria with fixed label supervision.")
 
     return {
         "step1_target": "Key points: " + "; ".join(seg for seg in step1_segments[:3] if seg),
@@ -2211,11 +2211,11 @@ def normalize_judge_input_drafts(draft_entries_raw: object) -> List[Dict[str, ob
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Holmes SFT data to LPCVC3-style JSONL.")
-    parser.add_argument("--holmes-root", type=Path, default=Path("/raid/ron/LPCVC/dataset/holmes"))
+    parser = argparse.ArgumentParser(description="Convert Holmes SFT data into Holmes-derived authenticity supervision JSONL.")
+    parser.add_argument("--holmes-root", type=Path, default=Path("/ssd4/LPCVC2026/dataset/holmes"))
     parser.add_argument("--input-jsonl", type=Path, default=None)
     parser.add_argument("--dataset-archive", type=Path, default=None)
-    parser.add_argument("--output-root", type=Path, default=Path("/raid/ron/LPCVC/holmes_lpcvc4/output"))
+    parser.add_argument("--output-root", type=Path, default=Path("/ssd4/LPCVC2026/Module-II-Final/teacher/stage1_g31b_v5_full_balanced"))
     parser.add_argument("--output-jsonl", type=Path, default=None)
     parser.add_argument("--stats-path", type=Path, default=None)
     parser.add_argument("--draft-jsonl", type=Path, default=None)

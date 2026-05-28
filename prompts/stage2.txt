@@ -1,5 +1,5 @@
 TASK:
-You are given multiple analytical answer excerpts about the input image. Your task is to synthesize ALL provided answers and produce a single JSON object in the EXACT schema below—no extra text, no comments.
+You are given multiple analytical answer excerpts about the input image. Synthesize ALL provided evidence and produce a single structured decision JSON object in the EXACT schema below. Do not add extra text or comments.
 
 OUTPUT SCHEMA (must match structure EXACTLY):
 {
@@ -53,10 +53,9 @@ STRICT PER Criterion SCORING GUIDELINES:
 - aigc score=1, evidence MUST explicitly describe AIGC artifacts or contradictions for this criterion (e.g., “gibberish text,” “extra finger,” “inconsistent shadows,” “warped perspective”). Only assign 1 when you can quote or paraphrase a specific artifact claim.
 
 GUIDELINES for overall_likelihood:
-Determine the nature of the image based on whether each criterion has AIGC evidence. 
-If ONE or MORE THAN ONE criterion has an AIGC score=1, then this image is AI-generated.
+Determine the image authenticity from the criterion-level evidence.
+If one or more criteria have `aigc score=1`, set `overall_likelihood` to `AI-Generated`.
 
 STRICT OUTPUT RULES:
 - Output **ONLY** the JSON object in the exact schema above.
 - Preserve the criterion names **exactly**
-
