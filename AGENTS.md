@@ -1,17 +1,27 @@
-# LPCVC 2026 Track 3 Project Guide
+# Holmes-Derived AI Image Authenticity Project Guide
 
-This repository contains the working pipeline for LPCVC 2026 Track 3: AI-Generated Image Detection. The goal is to train a compact student Vision-Language Model (VLM) that predicts whether an input image is `Real` or `AI-Generated` and emits criterion-level evidence in the competition JSON format.
+This repository trains a compact student vision-language model that inspects one image, reasons across 8 fixed authenticity criteria, and emits a structured JSON decision. The active stack is **Gemma 4 E2B + Google AI Edge / MediaPipe**. Older `Qwen`, `LPCVC`, and Qualcomm-oriented artifacts are legacy only.
 
-## Task Summary
+## Active Architecture
 
-- Competition: LPCVC 2026 Track 3, AI-Generated Image Detection.
-- Input: one image.
-- Output: structured JSON with 8 criteria and an `overall_likelihood`.
-- Runtime gate: model must pass the speed threshold, documented as `> 15 TPS`, before accuracy is evaluated.
-- Target platform: Qualcomm Snapdragon 8 Elite Gen5 Mobile.
-- Expected deployment direction: ONNX model plus validation script, with Qualcomm AI Hub / AIMET quantization work still to be added.
+- Student backbone default: `google/gemma-4-E2B-it`
+- Training path: Holmes-derived deterministic multi-task QLoRA SFT
+- Deployment path: `HF fine-tune -> merge -> MediaPipe .task`
+- Secondary artifact: merged Hugging Face model directory for local validation and conversion
+- Reports: every new report path must emit **HTML**; JSON sidecars are optional machine-readable companions
 
-The 8 fixed criteria are:
+Do not add new active-path naming that reintroduces `lpcvc`, `competition`, `qwen`, `qualcomm`, `onnx`, `qnn`, or `aimet`. Legacy filenames may remain when they point to already-generated data.
+
+## Task Contract
+
+Input: one image.
+
+Output: JSON with:
+
+- `per_criterion`
+- `overall_likelihood`
+
+The 8 criteria are fixed and remain in this exact order:
 
 1. `Lighting & Shadows Consistency`
 2. `Edges & Boundaries`
@@ -22,29 +32,42 @@ The 8 fixed criteria are:
 7. `Human & Biological Structure Integrity`
 8. `Material & Object Details`
 
+Score semantics:
+
+- `aigc score = 1`: explicit grounded artifact evidence exists for the criterion
+- `aigc score = 0`: no grounded artifact is visible, or the criterion is not applicable
+- `overall_likelihood = AI-Generated` when one or more criteria have score `1`
+- `overall_likelihood = Real` when all criteria are `0`
+
 ## Repository Layout
 
-- `prompts/stage1.txt`: three Stage 1 image-analysis prompts.
-- `prompts/stage2.txt`: Stage 2 synthesis prompt for strict JSON output.
-- `prompts/evidence_trace.txt`, `prompts/taxonomy.txt`, `prompts/consistency.txt`: multi-task prompts for the derived supervision pipeline.
-- `teacher/`: Holmes-to-LPCVC teacher-data conversion pipeline.
-- `student/`: Qwen VLM SFT training and inference pipeline.
-- `run_eda.py`, `eda_results.md`: lightweight dataset inspection utility and previous EDA output.
+- `teacher/`: Holmes supervision conversion and derived-data builder
+- `student/`: Gemma student training, inference, evaluation, visual expert, and deployment helpers
+- `prompts/`: final JSON, evidence trace, taxonomy, and consistency prompts
+- `run_eda.py`: repo-relative dataset EDA utility
+
+Important active files:
+
+- `student/src/train.py`
+- `student/src/inference.py`
+- `student/src/evaluate.py`
+- `student/src/merge_student.py`
+- `student/src/export_mediapipe_task.py`
+- `student/src/task_utils.py`
+
+Legacy compatibility file:
+
+- `student/src/lpcvc_utils.py`: shim only; new code should import `task_utils`
 
 ## Data Sources
 
-The original Holmes dataset is expected at:
+Expected Holmes source root:
 
 ```text
 /ssd4/LPCVC2026/dataset/holmes
 ```
 
-The source dataset normally contains:
-
-- `SFTDATA.jsonl`
-- `dataset_huggingface.zip`
-
-The local generated teacher dataset in this repository is:
+Local teacher dataset:
 
 ```text
 teacher/stage1_g31b_v5_full_balanced/
@@ -54,14 +77,9 @@ teacher/stage1_g31b_v5_full_balanced/
   images/1_fake/
 ```
 
-Current local generated dataset status:
+The filename `holmes_lpcvc_sft.jsonl` is a legacy artifact name. Treat it as historical only.
 
-- rows: `32070`
-- labels: `16035 Real`, `16035 AI-Generated`
-- all `image` fields resolve relative to `teacher/stage1_g31b_v5_full_balanced/`
-- current rows use the generator-only schema: `step2_draft`, not full reviewed `step2_target`
-
-The deterministic derived dataset generated from the existing teacher labels is:
+Deterministic derived dataset:
 
 ```text
 teacher/derived_deterministic_v1/
@@ -69,7 +87,7 @@ teacher/derived_deterministic_v1/
   manifest.json
 ```
 
-Its rows keep the original `image` and `original_response`, and add:
+Derived rows add:
 
 - `final_json_target`
 - `evidence_trace_target`
@@ -77,67 +95,20 @@ Its rows keep the original `image` and `original_response`, and add:
 - `consistency_target`
 - `quality_flags`
 
-There is also an external/generated dataset path used by defaults in the student code:
-
-```text
-/ssd4/LPCVC2026/holmes_lpcvc3_multi_teacher/stage1_g31b_v5_full_balanced
-```
-
-Use whichever dataset path is present and intended for the experiment. For a fully self-contained repo-relative run, pass the local teacher dataset path explicitly.
-
-## Target JSON Semantics
-
-Competition-style Stage 2 output should look like:
-
-```json
-{
-  "per_criterion": [
-    {
-      "criterion": "Lighting & Shadows Consistency",
-      "evidence": "Short criterion-specific evidence.",
-      "aigc score": 0
-    }
-  ],
-  "overall_likelihood": "Real"
-}
-```
-
-Score semantics:
-
-- `aigc score = 1`: this criterion has explicit AI-generation artifact evidence.
-- `aigc score = 0`: no artifact is visible for this criterion, or the criterion is not applicable.
-- `overall_likelihood = AI-Generated` whenever at least one criterion has score `1`.
-- `overall_likelihood = Real` when all criteria are score `0` and evidence supports a real image.
-
-Teacher conversion may use internal fields such as `proposed_score`, `support_type`, `holmes_span`, `judge_verdict`, and `final_score`. Student training converts the generator-only `step2_draft.per_criterion_draft[*].proposed_score` field into the competition-facing `aigc score` field.
-
 ## Teacher Pipeline
 
-Main file:
+Main files:
 
-```text
-teacher/convert_holmes_sft.py
-```
-
-Derived-data builder:
-
-```text
-teacher/build_derived_dataset.py
-```
+- `teacher/convert_holmes_sft.py`
+- `teacher/build_derived_dataset.py`
 
 Purpose:
 
-- Read Holmes `SFTDATA.jsonl`.
-- Resolve image files from `dataset_huggingface.zip`.
-- Derive the fixed overall label from the Holmes image path: `0_real` -> `Real`, `1_fake` -> `AI-Generated`.
-- Convert Holmes free-form explanations into LPCVC 8-criterion supervision.
-- Materialize images and write JSONL training rows.
-
-Supported pipeline stages:
-
-- `generator_only`: produce `step1_target` and `step2_draft`.
-- `full`: generator, normalization, judge, optional specialist, final `step2_target`.
-- `review_only`: review an existing draft JSONL.
+- Read Holmes `SFTDATA.jsonl`
+- Resolve images from `dataset_huggingface.zip`
+- Preserve Holmes-fixed labels derived from image path
+- Rewrite Holmes explanations into the 8 canonical criteria
+- Materialize draft JSONL and derived multi-task supervision
 
 Supported teacher backends:
 
@@ -145,7 +116,7 @@ Supported teacher backends:
 - `openai_compatible`
 - `transformers_gemma4`
 
-Typical generator-only command using the local repo output folder:
+Typical draft-generation command:
 
 ```bash
 python3 teacher/convert_holmes_sft.py \
@@ -160,20 +131,7 @@ python3 teacher/convert_holmes_sft.py \
   --overwrite-images
 ```
 
-Quick smoke test:
-
-```bash
-python3 -m py_compile teacher/convert_holmes_sft.py
-python3 teacher/convert_holmes_sft.py \
-  --holmes-root /ssd4/LPCVC2026/dataset/holmes \
-  --teacher-backend heuristic \
-  --pipeline-stage generator_only \
-  --max-samples 10 \
-  --output-root /tmp/lpcvc_teacher_smoke \
-  --overwrite-images
-```
-
-Build the deterministic derived dataset without regenerating labels:
+Build derived supervision without relabeling:
 
 ```bash
 python3 teacher/build_derived_dataset.py \
@@ -183,90 +141,73 @@ python3 teacher/build_derived_dataset.py \
 
 ## Student Training Pipeline
 
-Main files:
+Active student implementation:
 
-- `student/src/dataset.py`
-- `student/src/train.py`
-- `student/src/inference.py`
-- `student/src/evaluate.py`
-- `student/src/train_visual_expert.py`
-- `student/src/visual_expert.py`
-- `student/finetune.sh`
+- Backbone default: `google/gemma-4-E2B-it`
+- Training method: 4-bit QLoRA with PEFT LoRA adapters
+- Optimizer: `paged_adamw_8bit`
+- Precision: `bf16`
+- Gradient accumulation: `8`
+- Loss masking: tokens before the assistant response are `-100`
+- Training log requirement: `training.log` must persist `epoch`, `epoch_step`, `global_step`, progress percentage, loss, learning rate, and ETA
+- Before any full run, complete a LoRA smoke run on the active backbone and confirm the run can load the model, build the dataset, start optimization, and write checkpoints/logs.
+- Bound every smoke run explicitly with `--max_steps` so it finishes quickly and never turns into an accidental long run.
+- During active training, monitor loss and optimizer metrics from `training.log`; stop and inspect if loss diverges, becomes `NaN`, or shows obvious instability.
+- Run fixed-step sample evaluation during training and persist its artifacts under the run directory so prediction-vs-GT drift is inspectable without attaching to the process.
+- Every fixed-step sample evaluation must record at least final JSON parse status, predicted `overall_likelihood`, gold `overall_likelihood`, and raw prediction text for a deterministic sample slice.
+- Fixed-step trace generation should retry once with a larger token budget before recording a trace parse failure, so token-budget truncation is not misread as model collapse.
+- Do not judge checkpoint quality from a 2-row fixed-step sample alone; treat such a slice as a smoke signal only and use a larger offline evaluation slice before concluding that a checkpoint regressed.
+- Before merge or deployment, select a checkpoint explicitly. Do not assume the last checkpoint is the best deployment candidate.
+- Checkpoint selection must use at least one offline evaluation slice in addition to fixed-step sample evaluation artifacts.
 
-Current student implementation:
+Primary dataset:
 
-- Phase 1 backbone default: `Qwen/Qwen2.5-VL-3B-Instruct`.
-- Baseline-only legacy checkpoint: `student/outputs/20260427_105054/checkpoint-7014`.
-- Old LoRA adapters are for inference/evaluation baselines only; new Phase 1 runs start from the base model and create a fresh LoRA adapter.
-- Previous completed runs used `Qwen/Qwen2.5-VL-3B-Instruct`.
-- Training method: 4-bit QLoRA with PEFT LoRA adapters.
-- LoRA target modules: attention projections plus MLP projections.
-- Optimizer: `paged_adamw_8bit`.
-- Precision: `bf16`.
-- Gradient accumulation: `8`.
-- Loss masking: labels before the assistant response are set to `-100`.
-- Image preprocessing: images are loaded as RGB and thumbnail-limited to `1024 x 1024`.
-- Logging: `training.log`, TensorBoard logs, checkpoints, and `experiments_summary.json` under each run directory.
+- `teacher/derived_deterministic_v1/derived.jsonl`
 
-Dataset behavior:
+Task mix:
 
-- Primary input is the derived dataset: `teacher/derived_deterministic_v1/derived.jsonl`.
-- `image` is resolved via the row-level `image_root`, so the derived dataset does not need to copy images.
-- Each epoch re-samples one of four tasks per row using the configured task mix:
-  - `final_json`
-  - `evidence_trace`
-  - `taxonomy_classification`
-  - `consistency_check`
-- When `--visual_expert_path` points to `dataset_logits.jsonl`, training can add an auxiliary distillation loss through a lightweight pooled hidden-state head.
+- `final_json`
+- `evidence_trace`
+- `taxonomy_classification`
+- `consistency_check`
+
+Recommended task mix:
+
+```bash
+--task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
+```
 
 Repo-relative training example:
 
 ```bash
-cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
+  --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts \
   --output_dir student/outputs \
   --batch_size 2 \
   --epochs 3 \
   --lr 1e-4 \
-  --train_mode multitask_sft
+  --sample_eval_steps 500 \
+  --sample_eval_rows 4
 ```
 
-Recommended Phase 1 task mix:
+Smoke-run example:
 
 ```bash
---task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
-```
-
-Baseline evaluation:
-
-```bash
-python3 student/src/evaluate.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
-  --adapter_path student/outputs/20260427_105054/checkpoint-7014 \
+python3 student/src/train.py \
+  --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts
+  --prompt_dir prompts \
+  --output_dir student/outputs \
+  --run_name gemma4_e2b_smoke \
+  --batch_size 1 \
+  --epochs 1 \
+  --max_steps 5 \
+  --save_steps 5 \
+  --sample_eval_steps 5 \
+  --sample_eval_rows 2
 ```
-
-Using the wrapper script:
-
-```bash
-cd /ssd4/LPCVC2026/Module-II-Final/student
-./finetune.sh \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --derived_data_path /ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir /ssd4/LPCVC2026/Module-II-Final/prompts \
-  --output_dir /ssd4/LPCVC2026/Module-II-Final/student/outputs
-```
-
-Resume semantics:
-
-- `--resume_from_checkpoint` only continues the same run after interruption.
-- Use `--run_name <existing_run> --resume_from_checkpoint True` to resume the latest checkpoint in that run directory.
-- To resume a specific checkpoint, pass its explicit `checkpoint-*` path.
-- Do not use `--resume_from_checkpoint` as a way to initialize a new run from an old adapter.
 
 Visual expert training:
 
@@ -276,45 +217,102 @@ python3 student/src/train_visual_expert.py \
   --output_dir student/experts/default
 ```
 
-Phase 1 distillation round:
-
-```bash
-python3 student/src/train.py \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts \
-  --output_dir student/outputs \
-  --train_mode multitask_sft \
-  --task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}' \
-  --visual_expert_path student/experts/default/dataset_logits.jsonl \
-  --distill_weight 0.1 \
-  --batch_size 2 \
-  --epochs 3 \
-  --lr 1e-4
-```
-
-Inference CLI:
+Inference:
 
 ```bash
 python3 student/src/inference.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --image_path <image> \
-  --prompt_dir prompts \
-  --expert_path student/experts/default/expert.pt
+  --prompt_dir prompts
 ```
 
-Evaluation CLI:
+Evaluation:
 
 ```bash
 python3 student/src/evaluate.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts
 ```
 
-## Phase 1 TODO
+Legacy baseline:
+
+- `student/outputs/20260427_105054/checkpoint-7014`
+
+This checkpoint is historical only. Do not treat it as the active student line.
+
+Training evaluation artifacts:
+
+- `training.log`: persistent optimizer/progress metrics
+- `training_eval/step_<N>.json`: fixed-step sample evaluation JSON
+- `training_eval/step_<N>.html`: fixed-step sample evaluation HTML
+
+## Deployment Pipeline
+
+The official repo deployment path is:
+
+1. Fine-tune Gemma 4 E2B with LoRA
+2. Select a deployment checkpoint
+3. Merge the adapter into a full Hugging Face model directory
+4. Validate merged-model local inference
+5. Convert to LiteRT artifacts and bundle a MediaPipe `.task`
+6. If `.task` bundling is blocked by tokenizer packaging, preserve the LiteRT outputs and package a `model.litertlm` fallback
+7. Run the chosen Android artifact in the Google AI Edge runtime path
+
+Packaging environment requirements:
+
+- Use `uv venv .venv-google-ai-edge --python 3.11`
+- Install `student/deployment/requirements.txt`
+- Run packaging commands with `PYTHONNOUSERSITE=1`
+- Keep packaging and training environments separate
+
+Deployment CLIs:
+
+```bash
+python3 student/src/merge_student.py \
+  --base_model google/gemma-4-E2B-it \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --output_dir student/merged_models/gemma4_e2b_latest
+```
+
+```bash
+python3 student/src/export_mediapipe_task.py \
+  --merged_model_dir student/merged_models/gemma4_e2b_latest \
+  --output_dir student/mobile_artifacts/gemma4_e2b \
+  --tokenizer_model_path student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model \
+  --prefill_seq_len 128 \
+  --kv_cache_max_len 512 \
+  --trust_remote_code \
+  --keep_temporary_files
+```
+
+End-to-end packaging flow:
+
+```bash
+uv venv .venv-google-ai-edge --python 3.11
+source .venv-google-ai-edge/bin/activate
+uv pip install -r student/deployment/requirements.txt
+PYTHONNOUSERSITE=1 python student/src/merge_student.py \
+  --base_model google/gemma-4-E2B-it \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --output_dir student/merged_models/gemma4_e2b_latest
+PYTHONNOUSERSITE=1 python student/src/export_mediapipe_task.py \
+  --merged_model_dir student/merged_models/gemma4_e2b_latest \
+  --output_dir student/mobile_artifacts/gemma4_e2b \
+  --tokenizer_model_path student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model \
+  --prefill_seq_len 128 \
+  --kv_cache_max_len 512 \
+  --trust_remote_code \
+  --keep_temporary_files
+```
+
+`export_mediapipe_task.py` now runs LiteRT export directly, writes a conversion recipe and export guide, bundles a `.task` artifact when the base LiteRT model is available, and falls back to `model.litertlm` when MediaPipe bundling rejects the Hugging Face tokenizer JSON. On this workstation, the active `.task` path uses `student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model` as the explicit SentencePiece tokenizer asset.
+
+`.litertlm` remains a secondary research path. Do not make it the default repo deployment target.
+
+## Phase Status
 
 Status legend:
 
@@ -322,46 +320,22 @@ Status legend:
 - `[-]` in progress
 - `[ ]` pending
 
-Execution checklist:
-
-- `[x]` Deterministic derived dataset builder implemented and dataset materialized at `teacher/derived_deterministic_v1/derived.jsonl`
-- `[x]` Multi-task student pipeline implemented for `final_json`, `evidence_trace`, `taxonomy_classification`, `consistency_check`
-- `[x]` Visual expert training and distillation hooks implemented
-- `[x]` Baseline backbone fixed to `Qwen/Qwen2.5-VL-3B-Instruct`
-- `[x]` Best legacy baseline checkpoint fixed to `student/outputs/20260427_105054/checkpoint-7014`
-- `[x]` `resume_from_checkpoint` semantics corrected to mean same-run continuation only
-- `[x]` Training, inference, and evaluation CLI smoke-tested
-- `[x]` Run baseline evaluation smoke slice for `checkpoint-7014` and confirm the evaluation path is wired end to end
-- `[x]` Train full visual expert and write `expert.pt`, `dataset_logits.jsonl`, `metadata.json`
-- `[-]` Run Phase 1 round 1 multi-task SFT from base model with no distillation (`student/outputs/phase1_round1_20260526`, GPU 1)
-- `[ ]` Evaluate Phase 1 round 1 checkpoint against the legacy baseline
-- `[ ]` Run Phase 1 round 2 multi-task SFT with visual expert distillation (`distill_weight=0.1`)
-- `[ ]` Evaluate Phase 1 round 2 checkpoint and compare against baseline + round 1
-- `[ ]` Select the best Phase 1 checkpoint for downstream inference and further optimization
-
-Current working assumptions:
-
-- Old LoRA adapters are never used as initialization for new multi-task runs.
-- Baseline evaluation and later comparisons use the same derived dataset and prompt set.
-- The current long-running step is round 1 multi-task SFT from the base model without distillation.
-- `student/src/evaluate.py` is functionally correct after malformed-trace hardening, but its current throughput is too slow for large comparison slices; use sample-based reports first.
-
-## Prompt Flow
-
-Stage 1 uses three prompts to reduce overload:
-
-- edge, boundary, texture, resolution, material/object details
-- physical/common-sense logic, text/symbols, human/biological integrity
-- lighting/shadow consistency, perspective/spatial accuracy
-
-Stage 2 receives all Stage 1 analytical excerpts and must output only the final JSON object.
-
-When modifying prompts, keep these constraints:
-
-- preserve the 8 canonical criterion names exactly
-- preserve the JSON keys expected by the evaluator
-- avoid extra commentary around JSON
-- keep per-step outputs under the competition token limit
+- `[x]` Holmes-derived deterministic dataset builder exists
+- `[x]` Multi-task student pipeline exists
+- `[x]` Visual expert training hooks exist
+- `[x]` HTML report generation is wired into evaluation/report workflows
+- `[x]` Active backbone switched to Gemma 4 E2B in code and docs
+- `[x]` Merge and MediaPipe export helper CLIs added
+- `[x]` Gradient-path fix validated for Gemma 4 E2B QLoRA (`use_reentrant=False` plus post-PEFT input-gradient hook)
+- `[x]` Bounded Gemma 4 E2B LoRA smoke run completed at `student/outputs/gemma4_e2b_smoke_fix`
+- `[x]` First Gemma 4 E2B full training run completed at `student/outputs/gemma4_e2b_round1_20260527`
+- `[x]` Current deployment candidate checkpoint selected as `student/outputs/gemma4_e2b_round1_20260527/checkpoint-4000`
+- `[x]` Merged-model local inference validation on a real Gemma checkpoint
+- `[x]` LiteRT export validated for `student/outputs/gemma4_e2b_round1_20260527/checkpoint-4000`
+- `[x]` LiteRT-LM fallback artifact generated at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_export/model.litertlm`
+- `[x]` MediaPipe `.task` bundle created at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_export/gemma4-e2b-authenticity.task`
+- `[-]` `.task` validation is currently bundle-level only on this workstation; Android runtime integration is still pending
+- `[ ]` Android app integration smoke test
 
 ## Verification Commands
 
@@ -370,45 +344,39 @@ Syntax check:
 ```bash
 python3 -m py_compile \
   teacher/convert_holmes_sft.py \
-  student/src/dataset.py \
+  teacher/build_derived_dataset.py \
+  student/src/task_utils.py \
+  student/src/model_utils.py \
   student/src/train.py \
-  student/src/inference.py
+  student/src/inference.py \
+  student/src/evaluate.py \
+  student/src/merge_student.py \
+  student/src/export_mediapipe_task.py
 ```
 
-Inspect the local teacher dataset:
+Packaging environment build:
 
 ```bash
-python3 - <<'PY'
-import json, collections
-from pathlib import Path
-
-root = Path("teacher/stage1_g31b_v5_full_balanced")
-path = root / "holmes_lpcvc_sft.jsonl"
-labels = collections.Counter()
-missing = 0
-
-for line in path.open():
-    row = json.loads(line)
-    labels[row["step2_draft"]["overall_likelihood"]] += 1
-    if not (root / row["image"]).exists():
-        missing += 1
-
-print(labels)
-print("missing images:", missing)
-PY
+uv venv .venv-google-ai-edge --python 3.11
+source .venv-google-ai-edge/bin/activate
+uv pip install -r student/deployment/requirements.txt
 ```
 
 ## Known Gaps
 
-- ONNX export, AIMET quantization, AI Hub compile, and final mobile validation are not implemented in this repo yet.
-- Full-dataset evaluation is currently expensive because the pipeline performs two generations per sample plus the optional probes.
-- `student/finetune.sh` carries environment-specific absolute defaults. Override paths when running from this repository.
-- Current local teacher dataset is generator-only. Run `full` or `review_only` if reviewed `step2_target` supervision is required.
-- The current Phase 1 default backbone is `Qwen/Qwen2.5-VL-3B-Instruct`; older historical runs in `student/outputs/` include other backbones and should not be treated as current defaults.
+- MediaPipe `.task` export is documented and wrapped, but still depends on a working local LiteRT Torch + MediaPipe toolchain and version-compatible Gemma export builder.
+- LiteRT Torch public docs are still centered on Gemma 3 examples; Gemma 4 E2B export should be validated against the installed package version before treating it as production-ready.
+- On this workstation, Android export requires a clean isolated `uv` environment. Mixed user-site packages can break LiteRT export even when the model weights are healthy.
+- The current Hugging Face Gemma 4 E2B snapshot available locally exposes `tokenizer.json` but not `tokenizer.model`. The current `.task` flow works by supplying `student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model` explicitly.
+- This workstation can validate `.task` file creation and inspect bundled contents, but does not provide a local multimodal MediaPipe LLM runtime equivalent to the Android app path.
+- `.litertlm` is a future research artifact, not an active repo contract.
+- Full evaluation remains expensive because the pipeline performs two generations per sample plus optional probes.
 
 ## Editing Guidance
 
-- Keep criterion names, output keys, and score semantics stable.
-- Prefer repo-relative paths in new documentation and scripts, but note external dataset roots when they are required.
-- Do not treat teacher `proposed_score` as final reviewed truth unless the dataset was produced by the full review stage.
-- Avoid broad refactors in training code unless the change directly improves reproducibility, CLI usability, or competition compatibility.
+- Keep the 8 criteria, JSON keys, and score semantics stable.
+- Prefer repo-relative defaults in new scripts and docs.
+- Preserve legacy dataset filenames when renaming would break existing artifacts.
+- When changing prompts, do not change criterion order or output keys.
+- When changing training loops or callbacks, preserve persisted progress visibility in `training.log`.
+- Every new report-producing path must write HTML output; add JSON only as a companion artifact when useful.

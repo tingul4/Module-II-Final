@@ -1,216 +1,115 @@
-# Student VLM Training and Inference
+# Student Model Pipeline
 
-This folder contains the student-side implementation for LPCVC 2026 Track 3. The current pipeline uses a deterministic derived dataset built from the existing teacher labels, then trains a multi-task QLoRA student to emit evidence traces and final competition JSON.
+This folder contains the active student-side pipeline for Holmes-derived AI image authenticity reasoning. The active backbone is **`google/gemma-4-E2B-it`**. Older `Qwen` runs remain in `outputs/` as historical baselines only.
 
 ## Components
 
-- `src/dataset.py`: JSONL dataset loader, prompt loader, multi-task sample construction, image loading, and assistant-only loss masking.
-- `src/train.py`: QLoRA/LoRA SFT training entry point using Hugging Face `Trainer`.
-- `src/inference.py`: two-stage inference CLI for evidence trace plus final JSON.
-- `src/evaluate.py`: offline evaluation and probe CLI.
-- `src/train_visual_expert.py`: lightweight handcrafted-feature visual expert trainer.
-- `src/visual_expert.py`: feature extraction, expert MLP, and expert prediction helpers.
-- `finetune.sh`: convenience wrapper for training with environment-specific defaults.
-- `outputs/`: previous LoRA adapter runs and training logs.
+- `src/train.py`: multi-task QLoRA trainer
+- `src/inference.py`: two-stage image-to-JSON inference CLI
+- `src/evaluate.py`: offline evaluation plus HTML report output
+- `src/train_visual_expert.py`: handcrafted-feature visual expert trainer
+- `src/visual_expert.py`: visual expert feature extraction and inference helpers
+- `src/merge_student.py`: LoRA merge helper
+- `src/export_mediapipe_task.py`: MediaPipe `.task` export wrapper
+- `src/task_utils.py`: active task/schema helpers
+- `src/lpcvc_utils.py`: legacy compatibility shim
+- `finetune.sh`: convenience wrapper
 
-## Expected Dataset
+## Training Data
 
-Primary training input is the derived dataset:
+Primary input:
 
 ```text
-teacher/derived_deterministic_v1/
-  derived.jsonl
-  manifest.json
+teacher/derived_deterministic_v1/derived.jsonl
 ```
 
-Each JSONL row should include:
+Each row provides:
 
-```json
-{
-  "row_id": 0,
-  "image": "images/1_fake/example.jpg",
-  "image_root": "teacher/stage1_g31b_v5_full_balanced",
-  "original_response": "...",
-  "final_json_target": {
-    "overall_likelihood": "AI-Generated",
-    "per_criterion": []
-  },
-  "evidence_trace_target": {
-    "overall_likelihood": "AI-Generated",
-    "per_criterion": [
-      {
-        "criterion": "Lighting & Shadows Consistency",
-        "score": 1,
-        "evidence": "...",
-        "support_type": "explicit_holmes",
-        "holmes_span": "...",
-        "artifact_taxonomy": "shadow_mismatch",
-        "non_applicable": false,
-        "artifact_score_conflict": false
-      }
-    ]
-  },
-  "taxonomy_target": {},
-  "consistency_target": {},
-  "quality_flags": []
-}
-```
+- `final_json_target`
+- `evidence_trace_target`
+- `taxonomy_target`
+- `consistency_target`
+- `quality_flags`
 
-The derived rows keep `image` relative and store `image_root`, so images are resolved without copying them into the derived output directory.
+Images remain relative to the original teacher dataset through `image` + `image_root`.
 
 ## Training Behavior
 
-For each epoch, the dataset deterministically re-samples one task per row from the configured task mix:
+The dataset deterministically re-samples one task per row per epoch:
 
-- `final_json`: synthesize the final competition JSON from a structured evidence trace.
-- `evidence_trace`: output the full 8-criterion evidence trace.
-- `taxonomy_classification`: predict `artifact_taxonomy` and `support_type` per criterion.
-- `consistency_check`: judge whether criterion scores are consistent with grounded evidence.
+- `final_json`
+- `evidence_trace`
+- `taxonomy_classification`
+- `consistency_check`
 
-Default task mix:
+Recommended task mix:
 
-- `final_json`: `0.40`
-- `evidence_trace`: `0.35`
-- `taxonomy_classification`: `0.15`
-- `consistency_check`: `0.10`
+```bash
+--task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
+```
 
-The processor chat template is used when available. Labels before the assistant response are masked to `-100`, so the loss is computed only on the answer. If `--visual_expert_path` points to `dataset_logits.jsonl`, `train.py` also adds an auxiliary distillation loss through a pooled hidden-state head.
+The student keeps the current multi-task QLoRA design:
 
-## Model and Training Setup
-
-Execution policy for the current Phase 1 pipeline:
-
-- Use `Qwen/Qwen2.5-VL-3B-Instruct` as the only training backbone.
-- Treat `student/outputs/20260427_105054/checkpoint-7014` as the baseline checkpoint for inference and evaluation only.
-- Do not initialize new multi-task SFT runs from an old LoRA adapter.
-- `--resume_from_checkpoint` is only for continuing the same run directory after interruption.
-
-`src/train.py` currently supports Qwen VL model classes through model-name matching:
-
-- names containing `Qwen2.5-VL` use `Qwen2_5_VLForConditionalGeneration`
-- names containing `Qwen2-VL` use `Qwen2VLForConditionalGeneration`
-- other names fall back to `AutoModelForCausalLM`
-
-Training uses:
-
-- 4-bit NF4 BitsAndBytes loading
-- PEFT LoRA adapters
-- LoRA rank `32`, alpha `64`, dropout `0.05`
-- target modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+- 4-bit NF4 loading
+- LoRA adapters
+- attention + MLP projection targets
 - `bf16`
 - gradient checkpointing
 - `paged_adamw_8bit`
-- cosine LR scheduler with `warmup_ratio=0.05`
-- TensorBoard logging
+- optional visual expert distillation via `--visual_expert_path`
+- fixed-step sample evaluation reports during training via `training_eval/step_<N>.{json,html}`
 
-## Run Training
+## Active Backbone Policy
 
-Baseline evaluation:
+- Active backbone: `google/gemma-4-E2B-it`
+- Historical baseline: `student/outputs/20260427_105054/checkpoint-7014`
+- Do not initialize new training runs from old adapters
+- `--resume_from_checkpoint` means same-run continuation only
 
-```bash
-cd /ssd4/LPCVC2026/Module-II-Final
-python3 student/src/evaluate.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
-  --adapter_path student/outputs/20260427_105054/checkpoint-7014 \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts
-```
+The model loader is now Gemma-first and uses a generic image-text path instead of Qwen-specific branching.
 
-Repo-relative example:
+## Train
 
 ```bash
 cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
+  --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts \
   --output_dir student/outputs \
   --batch_size 2 \
   --epochs 3 \
   --lr 1e-4 \
-  --train_mode multitask_sft
+  --sample_eval_steps 500 \
+  --sample_eval_rows 4
 ```
 
-Recommended task mix for Phase 1:
+Smoke run:
 
 ```bash
---task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
-```
-
-Use `--local_files_only` when the base model is already cached and network access should be avoided.
-
-Resume from a checkpoint:
-
-```bash
+cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
+  --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts \
   --output_dir student/outputs \
-  --run_name <existing_run> \
-  --resume_from_checkpoint True
+  --run_name gemma4_e2b_smoke \
+  --batch_size 1 \
+  --epochs 1 \
+  --max_steps 5 \
+  --save_steps 5 \
+  --sample_eval_steps 5 \
+  --sample_eval_rows 2
 ```
 
-`--resume_from_checkpoint True` looks for the latest `checkpoint-*` under `student/outputs/<existing_run>/`. To resume from a specific checkpoint, pass the explicit checkpoint path instead.
-
-Phase 1 round 2 with visual expert distillation:
-
-```bash
-python3 student/src/train.py \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts \
-  --output_dir student/outputs \
-  --train_mode multitask_sft \
-  --task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}' \
-  --visual_expert_path student/experts/default/dataset_logits.jsonl \
-  --distill_weight 0.1 \
-  --batch_size 2 \
-  --epochs 3 \
-  --lr 1e-4
-```
-
-Wrapper-script example:
+Wrapper script:
 
 ```bash
 cd /ssd4/LPCVC2026/Module-II-Final/student
-./finetune.sh \
-  --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-  --derived_data_path /ssd4/LPCVC2026/Module-II-Final/teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir /ssd4/LPCVC2026/Module-II-Final/prompts \
-  --output_dir /ssd4/LPCVC2026/Module-II-Final/student/outputs \
-  --batch_size 2 \
-  --epochs 3
+./finetune.sh --batch_size 2 --epochs 3
 ```
-
-Note: `finetune.sh` has absolute defaults for this machine. Override `--data_path`, `--prompt_dir`, and `--output_dir` when running from a different checkout.
-
-## Outputs
-
-Each training run writes to:
-
-```text
-student/outputs/<timestamp>/
-```
-
-Expected files include:
-
-- `training.log`
-- `tensorboard_logs/`
-- intermediate checkpoints
-- final LoRA adapter files such as `adapter_model.safetensors`
-- processor/tokenizer files
-- `experiments_summary.json`
-
-Previous completed run summaries in this repo include:
-
-- `20260423_165003`: `Qwen/Qwen2.5-VL-3B-Instruct`, batch size `2`, epochs `10`, LR `1e-4`
-- `20260424_210806`: `Qwen/Qwen2.5-VL-3B-Instruct`, batch size `8`, epochs `10`, LR `1e-4`
-- `20260427_105054/checkpoint-7014`: current best legacy checkpoint, kept as baseline only
 
 ## Visual Expert
-
-Train the lightweight handcrafted-feature expert:
 
 ```bash
 python3 student/src/train_visual_expert.py \
@@ -218,78 +117,87 @@ python3 student/src/train_visual_expert.py \
   --output_dir student/experts/default
 ```
 
-The output directory contains:
+Distillation round:
 
-- `expert.pt`
-- `dataset_logits.jsonl`
-- `metadata.json`
-
-`dataset_logits.jsonl` can be passed to `train.py --visual_expert_path` for distillation. `expert.pt` can be passed to `inference.py --expert_path` for lightweight score fusion.
+```bash
+python3 student/src/train.py \
+  --model_name_or_path google/gemma-4-E2B-it \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --prompt_dir prompts \
+  --output_dir student/outputs \
+  --visual_expert_path student/experts/default/dataset_logits.jsonl \
+  --distill_weight 0.1
+```
 
 ## Inference
 
-`src/inference.py` is now a CLI:
-
 ```bash
 python3 student/src/inference.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --image_path <image> \
-  --prompt_dir prompts \
-  --expert_path student/experts/default/expert.pt
+  --prompt_dir prompts
 ```
 
-It runs:
+The pipeline is:
 
-1. Evidence-trace generation.
-2. Final JSON synthesis from the trace.
-3. Optional visual-expert score fusion.
+1. generate `evidence_trace`
+2. synthesize `final_json`
+3. optionally fuse visual expert scores
 
 ## Evaluation
 
 ```bash
 python3 student/src/evaluate.py \
-  --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+  --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --prompt_dir prompts
 ```
 
-The evaluation script reports:
+Evaluation writes HTML reports when `--output_path` is provided.
 
-- JSON parse rate
-- overall accuracy and macro F1
-- per-criterion F1
-- support-type accuracy
-- taxonomy accuracy
-- consistency score
-- Real false-positive rate
-- blank-image, shuffle, and oracle-trace probes
+## Deployment
 
-Recommended comparison set:
+Primary deployment path:
 
-- legacy baseline: `student/outputs/20260427_105054/checkpoint-7014`
-- new multi-task SFT run without distillation
-- new multi-task SFT run with `--distill_weight 0.1`
+1. merge LoRA into a full HF model
+2. validate merged-model local inference
+3. convert to MediaPipe `.task`
+4. run on Android with MediaPipe LLM Inference API
 
-## Sanity Checks
-
-Compile check:
+Merge:
 
 ```bash
-python3 -m py_compile \
-  student/src/dataset.py \
-  student/src/train.py \
-  student/src/inference.py \
-  student/src/evaluate.py \
-  student/src/visual_expert.py \
-  student/src/train_visual_expert.py
+python3 student/src/merge_student.py \
+  --base_model google/gemma-4-E2B-it \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --output_dir student/merged_models/gemma4_e2b_latest
 ```
 
-Inspect a single dataset item shape through the trainer logs by starting a short run with `--epochs 1 --max_steps` support is not currently exposed, so use a small dataset copy for quick end-to-end tests.
+Prepare MediaPipe export workspace:
 
-## Current Limitations
+```bash
+python3 student/src/export_mediapipe_task.py \
+  --merged_model_dir student/merged_models/gemma4_e2b_latest \
+  --output_dir student/mobile_artifacts/gemma4_e2b \
+  --dry_run
+```
 
-- ONNX export, AIMET quantization, and Snapdragon validation are not implemented here.
-- Distillation uses a lightweight auxiliary head and expert logits; it is not DPO/ORPO or full collaborative decoding.
-- The handcrafted visual expert is meant for low-cost artifact priors, not as a standalone SOTA detector.
+This writes:
+
+- `conversion_recipe.json`
+- `EXPORT_GUIDE.md`
+
+If a LiteRT `.tflite` model already exists, the same script can also bundle a `.task` artifact.
+
+`.litertlm` is not part of the active repo contract yet.
+
+## Notes
+
+- `student/merged_models/`, `student/mobile_artifacts/`, `student/reports/`, and `student/experts/` are generated artifacts.
+- Each active training run should start with a short smoke run before the long run.
+- Use `--max_steps` on smoke runs so they stay bounded and predictable.
+- Inspect `training.log` for loss, learning rate, grad norm, and ETA.
+- Inspect `training_eval/step_<N>.html` to compare prediction output against fixed-slice ground truth during training.
+- Legacy filenames and historical run folders may still contain `lpcvc` or `qwen`; treat them as old artifacts, not active architecture.
