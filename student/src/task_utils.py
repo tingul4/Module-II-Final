@@ -97,6 +97,47 @@ def normalize_label(label: str) -> str:
     return UNCERTAIN_LABEL
 
 
+def normalize_final_prediction_payload(payload: Dict[str, object]) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        return payload
+
+    entry_map: Dict[str, Dict[str, object]] = {}
+    any_positive = False
+    for entry in payload.get("per_criterion", []):
+        if not isinstance(entry, dict):
+            continue
+        criterion = canonicalize_criterion(entry.get("criterion", ""))
+        if criterion not in CRITERIA or criterion in entry_map:
+            continue
+        score = 1 if int(entry.get("aigc score", 0) or 0) else 0
+        evidence = clean_text(entry.get("evidence", "")) or DEFAULT_EVIDENCE
+        normalized_entry = dict(entry)
+        normalized_entry["criterion"] = criterion
+        normalized_entry["evidence"] = evidence
+        normalized_entry["aigc score"] = score
+        entry_map[criterion] = normalized_entry
+        if score:
+            any_positive = True
+
+    normalized_entries = []
+    for criterion in CRITERIA:
+        normalized_entries.append(
+            entry_map.get(
+                criterion,
+                {
+                    "criterion": criterion,
+                    "evidence": DEFAULT_EVIDENCE,
+                    "aigc score": 0,
+                },
+            )
+        )
+
+    normalized_payload = dict(payload)
+    normalized_payload["per_criterion"] = normalized_entries
+    normalized_payload["overall_likelihood"] = FAKE_LABEL if any_positive else REAL_LABEL
+    return normalized_payload
+
+
 def canonicalize_criterion(name: str) -> str:
     cleaned = clean_text(name)
     for criterion in CRITERIA:
@@ -115,12 +156,26 @@ def truncate_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 
+def teacher_entry_score(entry: Dict[str, object]) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    if "final_score" in entry:
+        return 1 if int(entry.get("final_score", 0) or 0) else 0
+    if "proposed_score" in entry:
+        return 1 if int(entry.get("proposed_score", 0) or 0) else 0
+    if "score" in entry:
+        return 1 if int(entry.get("score", 0) or 0) else 0
+    if "aigc score" in entry:
+        return 1 if int(entry.get("aigc score", 0) or 0) else 0
+    return 0
+
+
 def format_final_prediction_json(step2_draft: Dict[str, object]) -> Dict[str, object]:
     per_criterion = []
     any_positive = False
     for criterion in CRITERIA:
         draft_entry = find_entry(step2_draft.get("per_criterion_draft", []), criterion)
-        score = 1 if int(draft_entry.get("proposed_score", 0) or 0) else 0
+        score = teacher_entry_score(draft_entry)
         evidence = clean_text(draft_entry.get("evidence", "")) or DEFAULT_EVIDENCE
         if score:
             any_positive = True
@@ -151,7 +206,7 @@ def evidence_trace_from_step2(step2_draft: Dict[str, object]) -> Dict[str, objec
     trace_entries = []
     for criterion in CRITERIA:
         draft_entry = find_entry(step2_draft.get("per_criterion_draft", []), criterion)
-        score = 1 if int(draft_entry.get("proposed_score", 0) or 0) else 0
+        score = teacher_entry_score(draft_entry)
         evidence = clean_text(draft_entry.get("evidence", "")) or DEFAULT_EVIDENCE
         support_type = clean_text(draft_entry.get("support_type", "")) or "unsupported"
         holmes_span = clean_text(draft_entry.get("holmes_span", ""))

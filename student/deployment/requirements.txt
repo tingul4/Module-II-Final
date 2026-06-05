@@ -1,5 +1,4 @@
 litert-torch==0.9.1
-mediapipe==0.10.35
 torchvision==0.24.0
 accelerate==1.11.0
 transformers==5.9.0

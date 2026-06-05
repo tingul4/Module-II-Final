@@ -1,9 +1,10 @@
+import json
 from pathlib import Path
 from typing import Tuple
 
 import torch
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForMultimodalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForMultimodalLM, AutoProcessor, AutoTokenizer
 
 try:
     from qwen_vl_utils import process_vision_info as _legacy_multimodal_process_vision_info
@@ -114,6 +115,66 @@ def move_inputs_to_generation_device(model, inputs):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         return inputs.to(device)
 
+
+def resolve_chat_template_text(
+    model_name_or_path: str,
+    *,
+    local_files_only: bool = False,
+) -> str:
+    model_path = Path(model_name_or_path)
+    if model_path.exists():
+        candidate = model_path / "chat_template.jinja"
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8")
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        template_path = hf_hub_download(
+            repo_id=model_name_or_path,
+            filename="chat_template.jinja",
+            local_files_only=local_files_only,
+        )
+        return Path(template_path).read_text(encoding="utf-8")
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        if tokenizer.chat_template:
+            return tokenizer.chat_template
+    raise FileNotFoundError(
+        f"Unable to resolve chat_template.jinja for {model_name_or_path}."
+    )
+
+
+def normalize_merged_chat_template(
+    base_model_name: str,
+    output_root: Path,
+    *,
+    local_files_only: bool = False,
+):
+    template_text = resolve_chat_template_text(
+        base_model_name,
+        local_files_only=local_files_only,
+    )
+    (output_root / "chat_template.jinja").write_text(
+        template_text,
+        encoding="utf-8",
+    )
+
+    tokenizer_config_path = output_root / "tokenizer_config.json"
+    if not tokenizer_config_path.exists():
+        return
+    tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+    tokenizer_config["chat_template"] = template_text
+    tokenizer_config_path.write_text(
+        json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def merge_lora_adapter(base_model_name: str, adapter_path: str, output_dir: str, local_files_only: bool = False) -> Tuple[str, str]:
     from peft import PeftModel
 
@@ -131,4 +192,9 @@ def merge_lora_adapter(base_model_name: str, adapter_path: str, output_dir: str,
     output_root.mkdir(parents=True, exist_ok=True)
     merged.save_pretrained(output_root, safe_serialization=True)
     processor.save_pretrained(output_root)
+    normalize_merged_chat_template(
+        base_model_name,
+        output_root,
+        local_files_only=local_files_only,
+    )
     return str(output_root), str(output_root / "config.json")

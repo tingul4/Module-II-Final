@@ -2229,14 +2229,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teacher-backend",
         choices=["heuristic", "openai_compatible", "transformers_gemma4"],
-        default="heuristic",
+        default="transformers_gemma4",
     )
     parser.add_argument("--api-base", type=str, default=os.environ.get("OPENAI_API_BASE", "http://127.0.0.1:8000/v1"))
     parser.add_argument("--judge-api-base", type=str, default=os.environ.get("OPENAI_JUDGE_API_BASE", ""))
     parser.add_argument("--specialist-api-base", type=str, default=os.environ.get("OPENAI_SPECIALIST_API_BASE", ""))
-    parser.add_argument("--model", type=str, default=os.environ.get("OPENAI_MODEL", ""))
-    parser.add_argument("--judge-model", type=str, default=os.environ.get("OPENAI_JUDGE_MODEL", ""))
-    parser.add_argument("--specialist-model", type=str, default=os.environ.get("OPENAI_SPECIALIST_MODEL", ""))
+    parser.add_argument("--model", type=str, default=os.environ.get("OPENAI_MODEL", "google/gemma-4-31B-it"))
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=os.environ.get("OPENAI_JUDGE_MODEL", "google/gemma-4-31B-it"),
+    )
+    parser.add_argument(
+        "--specialist-model",
+        type=str,
+        default=os.environ.get("OPENAI_SPECIALIST_MODEL", "google/gemma-4-31B-it"),
+    )
     parser.add_argument("--api-key-env", type=str, default="OPENAI_API_KEY")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -2255,7 +2263,12 @@ def parse_args() -> argparse.Namespace:
         help="Interleave Real and AI-Generated records before conversion so early progress is more balanced.",
     )
     parser.add_argument("--disable-judge", action="store_true")
-    parser.add_argument("--enable-specialist", action="store_true")
+    parser.add_argument(
+        "--enable-specialist",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable specialist review for judge-escalated high-risk criteria.",
+    )
     parser.add_argument("--overwrite-images", action="store_true")
     return parser.parse_args()
 
@@ -2269,7 +2282,7 @@ def build_backends(args: argparse.Namespace) -> TeacherBackends:
 
     def get_backend(role: str) -> TeacherBackend:
         if args.teacher_backend == "transformers_gemma4":
-            default_model = args.model or "google/gemma-4-e2b-it"
+            default_model = args.model or "google/gemma-4-31B-it"
             model_name = {
                 "generator": default_model,
                 "judge": args.judge_model or default_model,

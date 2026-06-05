@@ -1,12 +1,12 @@
 # Holmes-Derived AI Image Authenticity Project Guide
 
-This repository trains a compact student vision-language model that inspects one image, reasons across 8 fixed authenticity criteria, and emits a structured JSON decision. The active stack is **Gemma 4 E2B + Google AI Edge / MediaPipe**. Older `Qwen`, `LPCVC`, and Qualcomm-oriented artifacts are legacy only.
+This repository trains a compact student vision-language model that inspects one image, reasons across 8 fixed authenticity criteria, and emits a structured JSON decision. The active stack is **Gemma 4 E2B + Google AI Edge / LiteRT**. Older `Qwen`, `LPCVC`, and Qualcomm-oriented artifacts are legacy only.
 
 ## Active Architecture
 
 - Student backbone default: `google/gemma-4-E2B-it`
 - Training path: Holmes-derived deterministic multi-task QLoRA SFT
-- Deployment path: `HF fine-tune -> merge -> MediaPipe .task`
+- Deployment path: `HF fine-tune -> merge -> .litertlm`
 - Secondary artifact: merged Hugging Face model directory for local validation and conversion
 - Reports: every new report path must emit **HTML**; JSON sidecars are optional machine-readable companions
 
@@ -52,7 +52,7 @@ Important active files:
 - `student/src/inference.py`
 - `student/src/evaluate.py`
 - `student/src/merge_student.py`
-- `student/src/export_mediapipe_task.py`
+- `student/src/export_litert_model.py`
 - `student/src/task_utils.py`
 
 Legacy compatibility file:
@@ -159,6 +159,10 @@ Active student implementation:
 - Do not judge checkpoint quality from a 2-row fixed-step sample alone; treat such a slice as a smoke signal only and use a larger offline evaluation slice before concluding that a checkpoint regressed.
 - Before merge or deployment, select a checkpoint explicitly. Do not assume the last checkpoint is the best deployment candidate.
 - Checkpoint selection must use at least one offline evaluation slice in addition to fixed-step sample evaluation artifacts.
+- When reporting binary `overall_likelihood` metrics, normalize predicted final JSON back to the task contract before scoring: fill missing criteria with score `0`, then derive `overall_likelihood` from predicted criterion scores. Do not treat `Uncertain` as a stable third evaluation class for this task.
+- If the goal is to maximize overall classification `accuracy` / `macro F1`, compare Gemma-only results against a detector-first baseline on the same offline slice before changing prompts or training mix. The current verified external baseline is `AIGI-Holmes` CLIP LoRA.
+- Detector thresholds must be calibrated on an offline slice. The default detector threshold `0.5` may materially under-call fake images even when the detector score distribution is otherwise useful.
+- Treat detector-assisted inference as detector-first classification plus Gemma explanation unless a broader evaluation shows that Gemma materially improves the binary label beyond a small calibration bump.
 
 Primary dataset:
 
@@ -237,6 +241,26 @@ python3 student/src/evaluate.py \
   --prompt_dir prompts
 ```
 
+Detector-only slice evaluation on Blackwell must use a version-compatible PyTorch environment:
+
+```bash
+./.venv-google-ai-edge/bin/python student/src/run_clip_detector_eval.py \
+  --device cuda:1 \
+  --row_ids_path student/outputs/gemma4_lightweight_eval/eval_slice_row_ids.txt \
+  --output_root student/outputs/gemma4_lightweight_eval \
+  --output_prefix detector_clip_lora_gpu
+```
+
+Detector/Gemma fusion analysis:
+
+```bash
+./.venv-google-ai-edge/bin/python student/src/analyze_detector_fusion.py \
+  --detector_scores_path student/outputs/gemma4_lightweight_eval/detector_clip_lora_gpu.jsonl \
+  --gemma_predictions_path student/outputs/gemma4_lightweight_eval/predictions/ckpt4000_single_stage.jsonl \
+  --output_root student/outputs/gemma4_lightweight_eval \
+  --output_prefix detector_fusion_analysis
+```
+
 Legacy baseline:
 
 - `student/outputs/20260427_105054/checkpoint-7014`
@@ -257,8 +281,8 @@ The official repo deployment path is:
 2. Select a deployment checkpoint
 3. Merge the adapter into a full Hugging Face model directory
 4. Validate merged-model local inference
-5. Convert to LiteRT artifacts and bundle a MediaPipe `.task`
-6. If `.task` bundling is blocked by tokenizer packaging, preserve the LiteRT outputs and package a `model.litertlm` fallback
+5. Convert to LiteRT artifacts and bundle a `.litertlm` artifact
+6. Deploy the exported LiteRT asset set in the chosen Android runtime path
 7. Run the chosen Android artifact in the Google AI Edge runtime path
 
 Packaging environment requirements:
@@ -278,10 +302,9 @@ python3 student/src/merge_student.py \
 ```
 
 ```bash
-python3 student/src/export_mediapipe_task.py \
+python3 student/src/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
-  --tokenizer_model_path student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model \
   --prefill_seq_len 128 \
   --kv_cache_max_len 512 \
   --trust_remote_code \
@@ -298,19 +321,16 @@ PYTHONNOUSERSITE=1 python student/src/merge_student.py \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --output_dir student/merged_models/gemma4_e2b_latest
-PYTHONNOUSERSITE=1 python student/src/export_mediapipe_task.py \
+PYTHONNOUSERSITE=1 python student/src/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
-  --tokenizer_model_path student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model \
   --prefill_seq_len 128 \
   --kv_cache_max_len 512 \
   --trust_remote_code \
   --keep_temporary_files
 ```
 
-`export_mediapipe_task.py` now runs LiteRT export directly, writes a conversion recipe and export guide, bundles a `.task` artifact when the base LiteRT model is available, and falls back to `model.litertlm` when MediaPipe bundling rejects the Hugging Face tokenizer JSON. On this workstation, the active `.task` path uses `student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model` as the explicit SentencePiece tokenizer asset.
-
-`.litertlm` remains a secondary research path. Do not make it the default repo deployment target.
+`export_litert_model.py` is the active export CLI. It runs LiteRT export directly, writes a conversion recipe and export guide, and ensures the output workspace contains `model.litertlm` plus the split LiteRT `.tflite` assets required by the runtime path.
 
 ## Phase Status
 
@@ -325,16 +345,15 @@ Status legend:
 - `[x]` Visual expert training hooks exist
 - `[x]` HTML report generation is wired into evaluation/report workflows
 - `[x]` Active backbone switched to Gemma 4 E2B in code and docs
-- `[x]` Merge and MediaPipe export helper CLIs added
+- `[x]` Merge and LiteRT export helper CLIs added
 - `[x]` Gradient-path fix validated for Gemma 4 E2B QLoRA (`use_reentrant=False` plus post-PEFT input-gradient hook)
 - `[x]` Bounded Gemma 4 E2B LoRA smoke run completed at `student/outputs/gemma4_e2b_smoke_fix`
 - `[x]` First Gemma 4 E2B full training run completed at `student/outputs/gemma4_e2b_round1_20260527`
 - `[x]` Current deployment candidate checkpoint selected as `student/outputs/gemma4_e2b_round1_20260527/checkpoint-4000`
 - `[x]` Merged-model local inference validation on a real Gemma checkpoint
 - `[x]` LiteRT export validated for `student/outputs/gemma4_e2b_round1_20260527/checkpoint-4000`
-- `[x]` LiteRT-LM fallback artifact generated at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_export/model.litertlm`
-- `[x]` MediaPipe `.task` bundle created at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_export/gemma4-e2b-authenticity.task`
-- `[-]` `.task` validation is currently bundle-level only on this workstation; Android runtime integration is still pending
+- `[x]` LiteRT-LM export path validated for `student/outputs/gemma4_e2b_round1_20260527/checkpoint-4000`
+- `[-]` Android runtime integration is still pending on this workstation
 - `[ ]` Android app integration smoke test
 
 ## Verification Commands
@@ -351,7 +370,7 @@ python3 -m py_compile \
   student/src/inference.py \
   student/src/evaluate.py \
   student/src/merge_student.py \
-  student/src/export_mediapipe_task.py
+  student/src/export_litert_model.py
 ```
 
 Packaging environment build:
@@ -364,13 +383,14 @@ uv pip install -r student/deployment/requirements.txt
 
 ## Known Gaps
 
-- MediaPipe `.task` export is documented and wrapped, but still depends on a working local LiteRT Torch + MediaPipe toolchain and version-compatible Gemma export builder.
+- LiteRT export depends on a working local LiteRT Torch toolchain and version-compatible Gemma export builder.
 - LiteRT Torch public docs are still centered on Gemma 3 examples; Gemma 4 E2B export should be validated against the installed package version before treating it as production-ready.
 - On this workstation, Android export requires a clean isolated `uv` environment. Mixed user-site packages can break LiteRT export even when the model weights are healthy.
-- The current Hugging Face Gemma 4 E2B snapshot available locally exposes `tokenizer.json` but not `tokenizer.model`. The current `.task` flow works by supplying `student/deployment/tokenizers/gemma4_e2b_omote_ai/tokenizer.model` explicitly.
-- This workstation can validate `.task` file creation and inspect bundled contents, but does not provide a local multimodal MediaPipe LLM runtime equivalent to the Android app path.
-- `.litertlm` is a future research artifact, not an active repo contract.
+- The current Hugging Face Gemma 4 E2B snapshot available locally exposes `tokenizer.json`; the active export path packages tokenizer assets directly from the merged model directory.
+- This workstation can validate `.litertlm` creation and inspect exported LiteRT files, but does not provide a local multimodal MediaPipe runtime equivalent to the Android app path.
 - Full evaluation remains expensive because the pipeline performs two generations per sample plus optional probes.
+- On this workstation, the failure mode is environment-specific, not model-specific: the system `python3` path uses `torch 1.13.1+cu117`, which does not support Blackwell `sm_120` and can return all-zero CUDA results even for basic ops such as `matmul`, `conv`, and `sigmoid`. Do not trust detector GPU results from that environment.
+- A version-compatible PyTorch build is required for Blackwell GPU validation. The local `.venv-google-ai-edge` environment uses `torch 2.9.0+cu128`, advertises `sm_120`, and reproduces the `AIGI-Holmes` CLIP LoRA detector scores on GPU within numerical tolerance of the CPU reference.
 
 ## Editing Guidance
 

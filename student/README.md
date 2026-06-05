@@ -10,7 +10,7 @@ This folder contains the active student-side pipeline for Holmes-derived AI imag
 - `src/train_visual_expert.py`: handcrafted-feature visual expert trainer
 - `src/visual_expert.py`: visual expert feature extraction and inference helpers
 - `src/merge_student.py`: LoRA merge helper
-- `src/export_mediapipe_task.py`: MediaPipe `.task` export wrapper
+- `src/export_litert_model.py`: LiteRT split-model + `.litertlm` export CLI
 - `src/task_utils.py`: active task/schema helpers
 - `src/lpcvc_utils.py`: legacy compatibility shim
 - `finetune.sh`: convenience wrapper
@@ -163,8 +163,10 @@ Primary deployment path:
 
 1. merge LoRA into a full HF model
 2. validate merged-model local inference
-3. convert to MediaPipe `.task`
-4. run on Android with MediaPipe LLM Inference API
+3. export LiteRT split `.tflite` artifacts plus `model.litertlm`
+4. run on Android with MediaPipe LLM Inference API or another LiteRT-LM consumer
+
+The Android app-side inference contract should match `student/src/inference.py`: one stage with `prompts/evidence_trace.txt`, then one stage with `prompts/stage2.txt` plus the compacted stage-1 trace JSON. If you need a human-readable 8-criteria report, render it from the final JSON in the app layer.
 
 Merge:
 
@@ -175,10 +177,10 @@ python3 student/src/merge_student.py \
   --output_dir student/merged_models/gemma4_e2b_latest
 ```
 
-Prepare MediaPipe export workspace:
+Prepare LiteRT export workspace:
 
 ```bash
-python3 student/src/export_mediapipe_task.py \
+python3 student/src/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
   --dry_run
@@ -189,9 +191,23 @@ This writes:
 - `conversion_recipe.json`
 - `EXPORT_GUIDE.md`
 
-If a LiteRT `.tflite` model already exists, the same script can also bundle a `.task` artifact.
+If split LiteRT `.tflite` files already exist, the same script can rebuild `model.litertlm`.
 
-`.litertlm` is not part of the active repo contract yet.
+For a smaller experimental mobile bundle, this repo has already validated:
+
+```bash
+python3 student/src/export_litert_model.py \
+  --merged_model_dir student/merged_models/gemma4_e2b_round1_checkpoint4000 \
+  --output_dir student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_minimal_wi4 \
+  --quantize weight_only_wi4_afp32 \
+  --vision_quantize weight_only_wi4_afp32 \
+  --prefill_seq_len 128 \
+  --kv_cache_max_len 512 \
+  --trust_remote_code \
+  --keep_temporary_files
+```
+
+That export produced a `model.litertlm` of about `2.64 GB` decimal, close to the official LiteRT community Gemma 4 E2B size range.
 
 ## Notes
 

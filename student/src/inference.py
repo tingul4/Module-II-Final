@@ -12,6 +12,7 @@ from task_utils import (
     compact_json_dumps,
     compact_trace_payload,
     extract_first_json_object,
+    normalize_final_prediction_payload,
     safe_json_loads,
 )
 from visual_expert import predict_visual_expert
@@ -141,6 +142,7 @@ def main():
     final_json, parse_error = safe_json_loads(final_json_text)
     if final_json:
         final_json = apply_expert_fusion(final_json, args.expert_path, args.image_path, args.fusion_alpha)
+        final_json = normalize_final_prediction_payload(final_json)
 
     result = {
         "evidence_trace_text": evidence_trace_text,

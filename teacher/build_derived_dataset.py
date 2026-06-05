@@ -41,6 +41,16 @@ def iter_rows(path: Path) -> Iterable[Dict[str, object]]:
                 yield json.loads(line)
 
 
+def resolve_teacher_step2(row: Dict[str, object]) -> Dict[str, object]:
+    step2_internal = row.get("step2_internal")
+    if isinstance(step2_internal, dict) and step2_internal.get("per_criterion_draft"):
+        return step2_internal
+    step2_draft = row.get("step2_draft")
+    if isinstance(step2_draft, dict) and step2_draft.get("per_criterion_draft"):
+        return step2_draft
+    return {}
+
+
 def main() -> int:
     args = parse_args()
     output_root = args.output_root
@@ -57,9 +67,9 @@ def main() -> int:
 
     with derived_path.open("w", encoding="utf-8") as out_handle:
         for row_id, row in enumerate(iter_rows(args.input_jsonl)):
-            step2_draft = row.get("step2_draft", {})
-            final_json_target = format_final_prediction_json(step2_draft)
-            evidence_trace_target = evidence_trace_from_step2(step2_draft)
+            step2_source = resolve_teacher_step2(row)
+            final_json_target = format_final_prediction_json(step2_source)
+            evidence_trace_target = evidence_trace_from_step2(step2_source)
             taxonomy_target = taxonomy_target_from_trace(evidence_trace_target)
             consistency_target = consistency_target_from_trace(evidence_trace_target)
             quality_flags = quality_flags_from_trace(evidence_trace_target)
