@@ -10,7 +10,6 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
 from transformers import (
@@ -22,9 +21,19 @@ from transformers import (
 from transformers.trainer_callback import PrinterCallback
 
 from dataset import DerivedMultiTaskDataset, get_default_task_mix, set_seed
-from inference import apply_expert_fusion, generate_trace_payload
-from model_utils import load_image_text_model, load_processor, prepare_generation_inputs
-from task_utils import safe_json_loads
+from detectors.holmes_clip_lora.runtime import DEFAULT_THRESHOLD, default_checkpoint_path
+from evaluate import format_eta_seconds, render_markdown_report, run_evaluation
+from utils.eval_utils import (
+    ensure_split_manifest,
+    load_epoch_eval_reports,
+    render_checkpoint_ranking_markdown,
+    row_ids_for_split,
+    summarize_checkpoint_ranking,
+)
+from utils.model_utils import (
+    load_image_text_model,
+    load_processor,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -117,7 +126,6 @@ class EpochProgressCallback(TrainerCallback):
         self.current_grad_norm = None
         self.progress_log_steps = max(1, int(progress_log_steps))
         self.train_start_time = None
-        self.last_logged_step = 0
         self.session_start_step = None
 
     @staticmethod
@@ -141,7 +149,6 @@ class EpochProgressCallback(TrainerCallback):
         epochs = max(1, int(args.num_train_epochs))
         self.steps_per_epoch = max(1, state.max_steps // epochs)
         self.train_start_time = time.time()
-        self.last_logged_step = 0
         self.session_start_step = None
         self.logger.info(
             f"Training: {epochs} epochs, ~{self.steps_per_epoch} steps/epoch (total {state.max_steps})"
@@ -179,11 +186,7 @@ class EpochProgressCallback(TrainerCallback):
         if state.global_step <= 0:
             return
 
-        should_log = (
-            state.global_step == 1
-            or state.global_step == state.max_steps
-            or state.global_step - self.last_logged_step >= self.progress_log_steps
-        )
+        should_log = state.global_step == state.max_steps or state.global_step % self.progress_log_steps == 0
         if not should_log:
             return
 
@@ -221,7 +224,6 @@ class EpochProgressCallback(TrainerCallback):
             parts.append(f"grad_norm={self.current_grad_norm:.4g}")
         parts.append(f"eta={eta_text}")
         self.logger.info("[progress] " + " | ".join(parts))
-        self.last_logged_step = state.global_step
 
     def on_epoch_end(self, args, state, control, **kwargs):
         if self.pbar is not None:
@@ -237,224 +239,166 @@ class DatasetEpochCallback(TrainerCallback):
         self.dataset.set_epoch(int(state.epoch or 0))
 
 
-def load_eval_rows(dataset_path: str, max_rows: int) -> List[dict]:
-    rows = []
-    reals = []
-    fakes = []
-    with open(dataset_path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            target = row.get("final_json_target", {})
-            label = target.get("overall_likelihood", "")
-            if label == "Real":
-                reals.append(row)
-            elif label == "AI-Generated":
-                fakes.append(row)
-            if len(reals) >= max_rows and len(fakes) >= max_rows:
-                break
-    combined = []
-    limit_each = max(1, max_rows // 2)
-    combined.extend(reals[:limit_each])
-    combined.extend(fakes[:limit_each])
-    if len(combined) < max_rows:
-        seen = {int(item.get("row_id", -1)) for item in combined}
-        with open(dataset_path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                if len(combined) >= max_rows:
-                    break
-                row = json.loads(line)
-                row_id = int(row.get("row_id", -1))
-                if row_id in seen:
-                    continue
-                combined.append(row)
-    return combined[:max_rows]
-
-
-def resolve_eval_image_path(dataset_path: str, row: dict) -> str:
-    image_path = Path(str(row["image"]))
-    if image_path.is_absolute() and image_path.exists():
-        return str(image_path)
-    image_root = row.get("image_root")
-    if image_root:
-        candidate = Path(str(image_root)) / str(row["image"])
-        if candidate.exists():
-            return str(candidate)
-    return str(Path(dataset_path).parent / str(row["image"]))
-
-
-def render_training_eval_html(step: int, samples: List[dict], output_path: Path) -> None:
-    rows = []
-    for sample in samples:
-        rows.append(
-            "<tr>"
-            f"<td>{sample['row_id']}</td>"
-            f"<td>{sample['gold_overall']}</td>"
-            f"<td>{sample['pred_overall']}</td>"
-            f"<td>{'yes' if sample['final_json_parse_ok'] else 'no'}</td>"
-            f"<td>{sample['final_error']}</td>"
-            "</tr>"
-        )
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Training Eval Step {step}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; color: #111; }}
-    table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
-    th, td {{ border: 1px solid #ccc; padding: 8px 10px; text-align: left; vertical-align: top; }}
-    th {{ background: #f5f5f5; }}
-    pre {{ white-space: pre-wrap; margin: 0; }}
-  </style>
-</head>
-<body>
-  <h1>Training Eval Step {step}</h1>
-  <table>
-    <thead>
-      <tr><th>Row</th><th>GT</th><th>Pred</th><th>Parse OK</th><th>Parse Error</th></tr>
-    </thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
-</body>
-</html>
-"""
-    output_path.write_text(html, encoding="utf-8")
-
-
-class FixedStepEvalCallback(TrainerCallback):
+class EpochEvalCallback(TrainerCallback):
     def __init__(
         self,
         logger,
+        model_name: str,
         processor,
         dataset_path: str,
         prompt_dir: str,
         run_dir: Path,
-        eval_steps: int = 500,
-        max_rows: int = 4,
-        max_new_tokens_trace: int = 1024,
-        max_new_tokens_json: int = 768,
-        expert_path: Optional[str] = None,
-        fusion_alpha: float = 0.8,
+        split_manifest_path: Path,
+        detector_checkpoint_path: str,
+        detector_clip_weights: str,
+        detector_threshold: float,
+        local_files_only: bool,
     ):
         self.logger = logger
+        self.model_name = model_name
         self.processor = processor
         self.dataset_path = dataset_path
         self.prompt_dir = Path(prompt_dir)
         self.run_dir = Path(run_dir)
-        self.eval_steps = max(1, int(eval_steps))
-        self.max_rows = max(1, int(max_rows))
-        self.max_new_tokens_trace = int(max_new_tokens_trace)
-        self.max_new_tokens_json = int(max_new_tokens_json)
-        self.expert_path = expert_path
-        self.fusion_alpha = float(fusion_alpha)
-        self.rows = load_eval_rows(dataset_path, self.max_rows)
-        self.last_eval_step = 0
-        self.trace_prompt = (self.prompt_dir / "evidence_trace.txt").read_text(encoding="utf-8").strip()
-        self.final_prompt = (self.prompt_dir / "stage2.txt").read_text(encoding="utf-8").strip()
+        self.split_manifest_path = Path(split_manifest_path)
+        self.detector_checkpoint_path = detector_checkpoint_path
+        self.detector_clip_weights = detector_clip_weights
+        self.detector_threshold = float(detector_threshold)
+        self.local_files_only = bool(local_files_only)
+        self.last_eval_step = None
+        self.evidence_trace_prompt = (self.prompt_dir / "evidence_trace.txt").read_text(encoding="utf-8").strip()
+        self.final_json_prompt = (self.prompt_dir / "stage2.txt").read_text(encoding="utf-8").strip()
         self.output_dir = self.run_dir / "training_eval"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.epoch_checkpoint_dir = self.run_dir / "epoch_checkpoints"
+        self.epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    def _generate(self, model, image_path: str, prompt_text: str, max_new_tokens: int) -> str:
-        inputs = prepare_generation_inputs(self.processor, image_path, prompt_text)
-        with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-            trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-            output_text = self.processor.batch_decode(
-                trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-        return output_text[0]
+    @staticmethod
+    def _model_device(model) -> str:
+        return str(next(model.parameters()).device)
 
-    def _run_eval(self, model, step: int) -> None:
+    def _log_eval_progress(self, epoch_label: str, payload: dict) -> None:
+        self.logger.info(
+            "[epoch_eval_progress] epoch=%s | done=%s/%s | acc=%.3f | json_parse=%.3f | trace_parse=%.3f | "
+            "sec_per_sample=%.2f | eta=%s",
+            epoch_label,
+            payload["done"],
+            payload["total"],
+            float(payload["overall_accuracy"]),
+            float(payload["json_parse_rate"]),
+            float(payload["trace_json_parse_rate"]),
+            float(payload["sec_per_sample"] or 0.0),
+            format_eta_seconds(payload["eta_sec"]),
+        )
+
+    @staticmethod
+    def _epoch_index(epoch_value: Optional[float]) -> int:
+        numeric = float(epoch_value or 0.0)
+        if numeric <= 0:
+            return 1
+        rounded = int(numeric)
+        return rounded if numeric.is_integer() else max(1, rounded + 1)
+
+    def _snapshot_epoch_adapter(self, model, epoch_label: str, epoch_index: int, global_step: int) -> Path:
+        adapter_dir = self.epoch_checkpoint_dir / epoch_label
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(adapter_dir)
+        metadata = {
+            "epoch_label": epoch_label,
+            "epoch_index": int(epoch_index),
+            "global_step": int(global_step),
+            "base_model": self.model_name,
+        }
+        (adapter_dir / "epoch_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        return adapter_dir
+
+    def _run_eval(self, model, epoch_index: int, global_step: int) -> None:
+        epoch_label = f"epoch_{epoch_index:03d}"
+        if self.last_eval_step == int(global_step):
+            return
         model_was_training = model.training
         model.eval()
         previous_cache = getattr(model.config, "use_cache", None)
         if previous_cache is not None:
             model.config.use_cache = True
-
-        samples = []
-        parse_ok = 0
-        trace_parse_ok = 0
-        overall_ok = 0
+        adapter_path = self._snapshot_epoch_adapter(model, epoch_label, epoch_index, global_step)
         try:
-            for row in self.rows:
-                image_path = resolve_eval_image_path(self.dataset_path, row)
-                trace_text, trace_json, trace_error, trace_for_final, trace_retry_used = generate_trace_payload(
-                    model,
-                    self.processor,
-                    image_path,
-                    self.trace_prompt,
-                    self.max_new_tokens_trace,
-                )
-                trace_parse_ok += int(bool(trace_json))
-                final_prompt = (
-                    f"{self.final_prompt}\n\n"
-                    "Here is the structured evidence trace for this image:\n"
-                    f"{trace_for_final}\n\n"
-                    "Use the trace to synthesize the final structured decision JSON."
-                )
-                final_text = self._generate(model, image_path, final_prompt, self.max_new_tokens_json)
-                final_json, final_error = safe_json_loads(final_text)
-                if final_json and self.expert_path:
-                    final_json = apply_expert_fusion(final_json, self.expert_path, image_path, self.fusion_alpha)
-                parse_ok += int(bool(final_json))
-                gold = row["final_json_target"]
-                pred_overall = final_json.get("overall_likelihood") if final_json else ""
-                overall_ok += int(pred_overall == gold.get("overall_likelihood"))
-                samples.append(
-                    {
-                        "row_id": int(row.get("row_id", -1)),
-                        "image": row["image"],
-                        "gold_overall": gold.get("overall_likelihood", ""),
-                        "pred_overall": pred_overall,
-                        "trace_parse_ok": bool(trace_json),
-                        "trace_retry_used": trace_retry_used,
-                        "trace_error": trace_error,
-                        "final_json_parse_ok": bool(final_json),
-                        "final_error": final_error,
-                        "pred_trace_text": trace_text,
-                        "pred_final_text": final_text,
-                        "gold_final_json": gold,
-                    }
-                )
+            detector_device = self._model_device(model)
+            self.logger.info(
+                "[epoch_eval] start | epoch=%s | step=%s | detector_device=%s | slice=64 (32 real + 32 fake)",
+                epoch_label,
+                global_step,
+                detector_device,
+            )
+            eval_args = argparse.Namespace(
+                base_model=self.model_name,
+                adapter_path=str(adapter_path),
+                derived_data_path=self.dataset_path,
+                prompt_dir=str(self.prompt_dir),
+                max_samples=0,
+                eval_slice_count=64,
+                eval_slice_seed=42,
+                balanced_max_samples=0,
+                probe_samples=0,
+                max_new_tokens_trace=1536,
+                max_new_tokens_json=1024,
+                inference_mode="two_stage",
+                split="eval",
+                split_manifest_path=str(self.split_manifest_path),
+                prediction_source="detector_student",
+                teacher_reference="derived_target",
+                teacher_jsonl_path=str(REPO_ROOT / "teacher" / "stage1_g31b_v5_full_balanced" / "holmes_lpcvc_sft.jsonl"),
+                detector_checkpoint_path=self.detector_checkpoint_path,
+                detector_clip_weights=self.detector_clip_weights,
+                detector_threshold=self.detector_threshold,
+                detector_device=detector_device,
+                enable_cider=False,
+                progress_log_every=8,
+                row_ids_path=None,
+                predictions_path=str(self.output_dir / f"{epoch_label}.predictions.jsonl"),
+                local_files_only=self.local_files_only,
+                output_path=None,
+            )
+            report = run_evaluation(
+                eval_args,
+                student_bundle={
+                    "processor": self.processor,
+                    "model": model,
+                    "evidence_trace_prompt": self.evidence_trace_prompt,
+                    "final_json_prompt": self.final_json_prompt,
+                },
+                progress_callback=lambda payload: self._log_eval_progress(epoch_label, payload),
+            )
         finally:
             if previous_cache is not None:
                 model.config.use_cache = previous_cache
             if model_was_training:
                 model.train()
 
-        summary = {
-            "step": step,
-            "samples": len(samples),
-            "trace_json_parse_rate": trace_parse_ok / len(samples) if samples else 0.0,
-            "final_json_parse_rate": parse_ok / len(samples) if samples else 0.0,
-            "overall_accuracy": overall_ok / len(samples) if samples else 0.0,
-            "rows": samples,
-        }
-        json_path = self.output_dir / f"step_{step:06d}.json"
-        html_path = self.output_dir / f"step_{step:06d}.html"
-        json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        render_training_eval_html(step, samples, html_path)
+        report["epoch_index"] = int(epoch_index)
+        report["epoch_label"] = epoch_label
+        report["global_step"] = int(global_step)
+        report["adapter_path"] = str(adapter_path)
+        json_path = self.output_dir / f"{epoch_label}.json"
+        md_path = self.output_dir / f"{epoch_label}.md"
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        render_markdown_report(epoch_label, report, md_path)
+        self.last_eval_step = int(global_step)
         self.logger.info(
-            "[sample_eval] step=%s | samples=%s | trace_json_parse_rate=%.3f | final_json_parse_rate=%.3f | overall_accuracy=%.3f | report=%s",
-            step,
-            len(samples),
-            summary["trace_json_parse_rate"],
-            summary["final_json_parse_rate"],
-            summary["overall_accuracy"],
+            "[epoch_eval] epoch=%s | step=%s | overall_accuracy=%.3f | overall_macro_f1=%.3f | criterion_macro_f1=%.3f | rouge_l=%.3f | report=%s",
+            epoch_label,
+            global_step,
+            float(report.get("overall_accuracy") or 0.0),
+            float(report.get("overall_macro_f1") or 0.0),
+            float(report.get("criterion_macro_f1") or 0.0),
+            float(report.get("rouge_l") or 0.0),
             json_path,
         )
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
         if model is None or state.global_step <= 0:
             return
-        if state.global_step - self.last_eval_step < self.eval_steps and state.global_step != state.max_steps:
-            return
-        self.last_eval_step = state.global_step
-        self._run_eval(model, state.global_step)
+        self._run_eval(model, self._epoch_index(state.epoch), int(state.global_step))
 
 
 _VISION_KEYS = {
@@ -464,9 +408,6 @@ _VISION_KEYS = {
     "video_grid_thw",
 }
 _PAD_KEYS = {"input_ids", "attention_mask", "labels"}
-_FLOAT_KEYS = {"expert_overall_prob", "expert_criterion_probs", "expert_target_mask"}
-
-
 def custom_collate_fn(features):
     batch = {}
     keys = [key for key in features[0].keys() if key != "task_name"]
@@ -491,9 +432,6 @@ def custom_collate_fn(features):
             batch[key] = torch.nn.utils.rnn.pad_sequence(
                 tensors, batch_first=True, padding_value=0
             )
-            continue
-        if key in _FLOAT_KEYS:
-            batch[key] = torch.stack(tensors, dim=0)
             continue
         if torch.is_tensor(tensors[0]):
             batch[key] = torch.stack(tensors, dim=0)
@@ -552,7 +490,7 @@ def ensure_input_gradients(model) -> None:
         setattr(input_embeddings, "_codex_input_grad_hook", True)
 
 
-def build_model(model_name_or_path, local_files_only, enable_distillation=False):
+def build_model(model_name_or_path, local_files_only):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -581,63 +519,15 @@ def build_model(model_name_or_path, local_files_only, enable_distillation=False)
     )
     model = get_peft_model(model, lora_config)
     ensure_input_gradients(model)
-    if enable_distillation:
-        hidden_size = getattr(model.config, "hidden_size", None)
-        if hidden_size is None:
-            text_config = getattr(model.config, "text_config", None)
-            if text_config is not None:
-                hidden_size = getattr(text_config, "hidden_size", None)
-        if hidden_size is None:
-            raise ValueError("Unable to resolve hidden_size for distillation head")
-        model.distill_head = torch.nn.Linear(hidden_size, 9)
-        model.distill_head.to(next(model.parameters()).device)
     return model, lora_target_modules
 
 
 class MultiTaskTrainer(Trainer):
-    def __init__(self, *args, distill_weight: float = 0.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.distill_weight = distill_weight
-
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        task_names = inputs.pop("task_name", None)
-        row_ids = inputs.pop("row_id", None)
-        expert_overall = inputs.pop("expert_overall_prob", None)
-        expert_criteria = inputs.pop("expert_criterion_probs", None)
-        expert_mask = inputs.pop("expert_target_mask", None)
-
-        if self.distill_weight > 0 and hasattr(model, "distill_head"):
-            outputs = model(**inputs, output_hidden_states=True)
-        else:
-            outputs = model(**inputs)
-
+        inputs.pop("task_name", None)
+        inputs.pop("row_id", None)
+        outputs = model(**inputs)
         loss = outputs.loss
-        metrics = {}
-        if (
-            self.distill_weight > 0
-            and hasattr(model, "distill_head")
-            and expert_mask is not None
-            and torch.any(expert_mask > 0)
-        ):
-            hidden_states = outputs.hidden_states[-1]
-            attention_mask = inputs["attention_mask"].float()
-            pooled = (hidden_states * attention_mask.unsqueeze(-1)).sum(dim=1)
-            pooled = pooled / attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            model.distill_head.to(pooled.device)
-            distill_logits = model.distill_head(pooled)
-            distill_targets = torch.cat([expert_overall, expert_criteria], dim=1).to(distill_logits.device)
-            distill_mask = expert_mask.to(distill_logits.device).view(-1, 1)
-            distill_loss = F.binary_cross_entropy_with_logits(
-                distill_logits,
-                distill_targets,
-                reduction="none",
-            )
-            distill_loss = (distill_loss * distill_mask).sum() / distill_mask.sum().clamp_min(1.0)
-            loss = loss + self.distill_weight * distill_loss
-            metrics["distill_loss"] = float(distill_loss.detach().cpu())
-
-        if metrics:
-            self.log(metrics)
         return (loss, outputs) if return_outputs else loss
 
 
@@ -707,15 +597,17 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--progress_log_steps", type=int, default=10)
-    parser.add_argument("--sample_eval_steps", type=int, default=500)
-    parser.add_argument("--sample_eval_rows", type=int, default=4)
-    parser.add_argument("--sample_eval_max_new_tokens_trace", type=int, default=1024)
-    parser.add_argument("--sample_eval_max_new_tokens_json", type=int, default=768)
     parser.add_argument("--task_mix", type=str, default=None)
-    parser.add_argument("--visual_expert_path", type=str, default=None)
-    parser.add_argument("--distill_weight", type=float, default=0.0)
     parser.add_argument("--trace_evidence_words", type=int, default=14)
     parser.add_argument("--trace_holmes_span_words", type=int, default=12)
+    parser.add_argument("--eval_ratio", type=float, default=0.10)
+    parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument("--split_manifest_path", type=str, default=None)
+    parser.add_argument("--regenerate_split", action="store_true")
+    parser.add_argument("--disable_epoch_eval", action="store_true")
+    parser.add_argument("--detector_checkpoint_path", type=str, default=default_checkpoint_path())
+    parser.add_argument("--detector_clip_weights", type=str, default=None)
+    parser.add_argument("--detector_threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     return parser.parse_args()
@@ -733,21 +625,44 @@ def main():
         f"Config | derived_data={args.derived_data_path or args.data_path} | bs={args.batch_size} | "
         f"epochs={args.epochs} | max_steps={args.max_steps} | lr={args.lr} | local_only={args.local_files_only}"
     )
+    if not args.disable_epoch_eval and (
+        not args.detector_clip_weights or not Path(args.detector_clip_weights).exists()
+    ):
+        raise FileNotFoundError(
+            "epoch-level detector_student evaluation requires --detector_clip_weights <ViT-L-14-336px.pt>."
+        )
 
     processor = load_processor(args.model_name_or_path, local_files_only=args.local_files_only)
     dataset_path = resolve_dataset_path(args)
+    split_manifest_path, split_manifest = ensure_split_manifest(
+        Path(dataset_path),
+        eval_ratio=args.eval_ratio,
+        seed=args.split_seed,
+        manifest_path=Path(args.split_manifest_path) if args.split_manifest_path else None,
+        regenerate=args.regenerate_split,
+    )
+    train_row_ids = row_ids_for_split(split_manifest, "train") or set()
+    eval_row_ids = row_ids_for_split(split_manifest, "eval") or set()
     task_mix = parse_task_mix(args.task_mix)
     train_dataset = DerivedMultiTaskDataset(
         dataset_path,
         args.prompt_dir,
         processor=processor,
         task_mix=task_mix,
-        expert_targets_path=args.visual_expert_path,
         trace_evidence_words=args.trace_evidence_words,
         trace_holmes_span_words=args.trace_holmes_span_words,
         seed=args.seed,
+        allowed_row_ids=train_row_ids,
     )
-    logger.info(f"Dataset loaded: {len(train_dataset)} rows from {dataset_path}")
+    logger.info(f"Dataset loaded: {len(train_dataset)} train rows from {dataset_path}")
+    logger.info(
+        "Split manifest: %s | train_rows=%s | eval_rows=%s | eval_ratio=%.3f | split_seed=%s",
+        split_manifest_path,
+        len(train_row_ids),
+        len(eval_row_ids),
+        args.eval_ratio,
+        args.split_seed,
+    )
     logger.info(f"Task mix: {task_mix}")
 
     if len(train_dataset) > 0:
@@ -759,38 +674,37 @@ def main():
         }
         logger.info(f"Sample keys/shapes: {shape_info} | task={sample['task_name']}")
 
-    enable_distillation = bool(args.visual_expert_path and args.distill_weight > 0)
-    model, lora_target_modules = build_model(
-        args.model_name_or_path,
-        args.local_files_only,
-        enable_distillation=enable_distillation,
-    )
+    model, lora_target_modules = build_model(args.model_name_or_path, args.local_files_only)
     logger.info(f"LoRA target modules: {lora_target_modules}")
     model.print_trainable_parameters()
 
     training_args = build_training_args(args, run_dir)
+    callbacks = [
+        EpochProgressCallback(logger, progress_log_steps=args.progress_log_steps),
+        DatasetEpochCallback(train_dataset),
+    ]
+    if not args.disable_epoch_eval:
+        callbacks.append(
+            EpochEvalCallback(
+                logger,
+                model_name=args.model_name_or_path,
+                processor=processor,
+                dataset_path=dataset_path,
+                prompt_dir=args.prompt_dir,
+                run_dir=Path(run_dir),
+                split_manifest_path=split_manifest_path,
+                detector_checkpoint_path=args.detector_checkpoint_path,
+                detector_clip_weights=args.detector_clip_weights,
+                detector_threshold=args.detector_threshold,
+                local_files_only=args.local_files_only,
+            )
+        )
     trainer = MultiTaskTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=custom_collate_fn,
-        callbacks=[
-            EpochProgressCallback(logger, progress_log_steps=args.progress_log_steps),
-            DatasetEpochCallback(train_dataset),
-            FixedStepEvalCallback(
-                logger,
-                processor,
-                dataset_path=dataset_path,
-                prompt_dir=args.prompt_dir,
-                run_dir=Path(run_dir),
-                eval_steps=args.sample_eval_steps,
-                max_rows=args.sample_eval_rows,
-                max_new_tokens_trace=args.sample_eval_max_new_tokens_trace,
-                max_new_tokens_json=args.sample_eval_max_new_tokens_json,
-                expert_path=args.visual_expert_path if args.distill_weight > 0 else None,
-            ),
-        ],
-        distill_weight=args.distill_weight,
+        callbacks=callbacks,
     )
     trainer.remove_callback(PrinterCallback)
 
@@ -801,9 +715,15 @@ def main():
     trainer.train(resume_from_checkpoint=resume_ckpt)
     trainer.save_model(run_dir)
     processor.save_pretrained(run_dir)
-    if enable_distillation and hasattr(model, "distill_head"):
-        torch.save(model.distill_head.state_dict(), os.path.join(run_dir, "distill_head.pt"))
     logger.info("Training completed and model saved.")
+
+    ranking_json_path = Path(run_dir) / "training_eval" / "checkpoint_ranking.json"
+    ranking_summary = summarize_checkpoint_ranking(load_epoch_eval_reports(Path(run_dir) / "training_eval"))
+    if not args.disable_epoch_eval:
+        ranking_md_path = ranking_json_path.with_suffix(".md")
+        ranking_json_path.write_text(json.dumps(ranking_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        render_checkpoint_ranking_markdown(ranking_summary, ranking_md_path)
+        logger.info("Checkpoint ranking written: %s", ranking_json_path)
 
     summary = {
         "timestamp": Path(run_dir).name,
@@ -815,14 +735,21 @@ def main():
         "lr": args.lr,
         "train_mode": args.train_mode,
         "task_mix": task_mix,
-        "visual_expert_path": args.visual_expert_path,
-        "distill_weight": args.distill_weight,
         "trace_evidence_words": args.trace_evidence_words,
         "trace_holmes_span_words": args.trace_holmes_span_words,
-        "sample_eval_steps": args.sample_eval_steps,
-        "sample_eval_rows": args.sample_eval_rows,
-        "sample_eval_max_new_tokens_trace": args.sample_eval_max_new_tokens_trace,
-        "sample_eval_max_new_tokens_json": args.sample_eval_max_new_tokens_json,
+        "eval_ratio": args.eval_ratio,
+        "split_seed": args.split_seed,
+        "split_manifest_path": str(split_manifest_path),
+        "train_rows": len(train_row_ids),
+        "eval_rows": len(eval_row_ids),
+        "epoch_eval_enabled": not args.disable_epoch_eval,
+        "epoch_eval_prediction_source": "detector_student" if not args.disable_epoch_eval else None,
+        "epoch_eval_split": "eval",
+        "detector_checkpoint_path": args.detector_checkpoint_path,
+        "detector_clip_weights": args.detector_clip_weights,
+        "detector_threshold": args.detector_threshold,
+        "best_epoch_checkpoint": ranking_summary.get("best_checkpoint_path"),
+        "checkpoint_ranking_path": str(ranking_json_path) if not args.disable_epoch_eval else None,
         "status": "Training Completed",
         "log_dir": str(run_dir),
     }

@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from task_utils import (
+from utils.task_utils import (
     CRITERIA,
     compact_json_dumps,
     compact_trace_payload,
@@ -68,10 +68,10 @@ class DerivedMultiTaskDataset(Dataset):
         processor,
         max_length=2048,
         task_mix: Optional[Dict[str, float]] = None,
-        expert_targets_path: Optional[str] = None,
         trace_evidence_words: int = 14,
         trace_holmes_span_words: int = 12,
         seed: int = 42,
+        allowed_row_ids: Optional[set[int]] = None,
     ):
         self.data = []
         self.epoch = 0
@@ -85,8 +85,6 @@ class DerivedMultiTaskDataset(Dataset):
         self.task_names = list(self.task_mix.keys())
         self.task_probs = self._normalize_task_mix(self.task_mix)
         self.prompts = self._load_prompts()
-        self.expert_targets = self._load_expert_targets(expert_targets_path)
-
         jsonl_path = Path(jsonl_path)
         base_dir = jsonl_path.parent
         with jsonl_path.open("r", encoding="utf-8") as handle:
@@ -94,6 +92,9 @@ class DerivedMultiTaskDataset(Dataset):
                 if not line.strip():
                     continue
                 item = json.loads(line)
+                row_id = int(item.get("row_id", len(self.data)))
+                if allowed_row_ids is not None and row_id not in allowed_row_ids:
+                    continue
                 image_path = Path(item["image"])
                 if not image_path.is_absolute():
                     image_root = item.get("image_root")
@@ -101,6 +102,7 @@ class DerivedMultiTaskDataset(Dataset):
                         image_path = Path(image_root) / item["image"]
                     else:
                         image_path = base_dir / item["image"]
+                item["row_id"] = row_id
                 item["full_image_path"] = os.fspath(image_path)
                 self.data.append(item)
 
@@ -109,31 +111,6 @@ class DerivedMultiTaskDataset(Dataset):
         if total <= 0:
             raise ValueError("task_mix must contain positive weights")
         return [max(0.0, float(task_mix[name])) / total for name in self.task_names]
-
-    def _load_expert_targets(self, expert_targets_path: Optional[str]) -> Dict[str, Dict[str, torch.Tensor]]:
-        if not expert_targets_path:
-            return {}
-        path = Path(expert_targets_path)
-        if path.is_dir():
-            path = path / "dataset_logits.jsonl"
-        if not path.exists():
-            return {}
-        targets = {}
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                targets[str(row["image"])] = {
-                    "expert_overall_prob": torch.tensor(
-                        [float(torch.sigmoid(torch.tensor(row["overall_logit"])).item())],
-                        dtype=torch.float32,
-                    ),
-                    "expert_criterion_probs": torch.sigmoid(
-                        torch.tensor(row["criterion_logits"], dtype=torch.float32)
-                    ),
-                }
-        return targets
 
     def _load_prompts(self):
         prompts = {}
@@ -248,16 +225,6 @@ class DerivedMultiTaskDataset(Dataset):
             key: (value if key in no_squeeze else value.squeeze(0))
             for key, value in inputs.items()
         }
-
-        expert_target = self.expert_targets.get(str(item["image"]))
-        if expert_target:
-            inputs_dict["expert_overall_prob"] = expert_target["expert_overall_prob"]
-            inputs_dict["expert_criterion_probs"] = expert_target["expert_criterion_probs"]
-            inputs_dict["expert_target_mask"] = torch.tensor([1.0], dtype=torch.float32)
-        else:
-            inputs_dict["expert_overall_prob"] = torch.zeros(1, dtype=torch.float32)
-            inputs_dict["expert_criterion_probs"] = torch.zeros(len(CRITERIA), dtype=torch.float32)
-            inputs_dict["expert_target_mask"] = torch.tensor([0.0], dtype=torch.float32)
 
         inputs_dict["task_name"] = task_name
         inputs_dict["row_id"] = torch.tensor(int(item.get("row_id", idx)), dtype=torch.long)

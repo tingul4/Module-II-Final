@@ -75,6 +75,51 @@ ARTIFACT_TAXONOMY_RULES = {
     ],
 }
 
+CRITERION_ALIAS_MAP = {
+    "lighting shadows consistency": "Lighting & Shadows Consistency",
+    "lighting and shadows consistency": "Lighting & Shadows Consistency",
+    "edges boundaries": "Edges & Boundaries",
+    "edges and boundaries": "Edges & Boundaries",
+    "edge boundary integrity": "Edges & Boundaries",
+    "edge and boundary integrity": "Edges & Boundaries",
+    "texture resolution": "Texture & Resolution",
+    "texture and resolution": "Texture & Resolution",
+    "texture detail resolution": "Texture & Resolution",
+    "texture detail and resolution": "Texture & Resolution",
+    "texture detail integrity": "Texture & Resolution",
+    "texture and detail integrity": "Texture & Resolution",
+    "perspective spatial relationships": "Perspective & Spatial Relationships",
+    "perspective and spatial relationships": "Perspective & Spatial Relationships",
+    "perspective spatial coherence": "Perspective & Spatial Relationships",
+    "perspective and spatial coherence": "Perspective & Spatial Relationships",
+    "composition perspective": "Perspective & Spatial Relationships",
+    "composition and perspective": "Perspective & Spatial Relationships",
+    "object coherence placement": "Perspective & Spatial Relationships",
+    "object coherence and placement": "Perspective & Spatial Relationships",
+    "physical common sense logic": "Physical & Common Sense Logic",
+    "physical and common sense logic": "Physical & Common Sense Logic",
+    "object placement physicality": "Physical & Common Sense Logic",
+    "object placement and physicality": "Physical & Common Sense Logic",
+    "scale proportion fidelity": "Perspective & Spatial Relationships",
+    "scale and proportion fidelity": "Perspective & Spatial Relationships",
+    "text symbols": "Text & Symbols",
+    "text and symbols": "Text & Symbols",
+    "text symbol readability": "Text & Symbols",
+    "text symbolic readability": "Text & Symbols",
+    "text graphic symbolic elements": "Text & Symbols",
+    "text graphic and symbolic elements": "Text & Symbols",
+    "human biological structure integrity": "Human & Biological Structure Integrity",
+    "human and biological structure integrity": "Human & Biological Structure Integrity",
+    "human figure object structure": "Human & Biological Structure Integrity",
+    "human figure and object structure": "Human & Biological Structure Integrity",
+    "material object details": "Material & Object Details",
+    "material and object details": "Material & Object Details",
+    "texture material realism": "Material & Object Details",
+    "texture and material realism": "Material & Object Details",
+    "background environment context": "Material & Object Details",
+    "background and environment context": "Material & Object Details",
+}
+
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
@@ -86,6 +131,10 @@ def json_dumps(obj: object) -> str:
 
 def compact_json_dumps(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def criterion_lookup_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", clean_text(name).casefold()).strip()
 
 
 def normalize_label(label: str) -> str:
@@ -143,6 +192,9 @@ def canonicalize_criterion(name: str) -> str:
     for criterion in CRITERIA:
         if cleaned == criterion:
             return criterion
+    alias = CRITERION_ALIAS_MAP.get(criterion_lookup_key(cleaned))
+    if alias:
+        return alias
     return cleaned
 
 
@@ -333,11 +385,18 @@ def find_entry(entries: object, criterion: str) -> Dict[str, object]:
     return {"criterion": criterion, "proposed_score": 0, "evidence": DEFAULT_EVIDENCE}
 
 
-def extract_first_json_object(text: str) -> str:
-    start = text.find("{")
+def extract_first_json_value(text: str) -> str:
+    object_start = text.find("{")
+    array_start = text.find("[")
+    start_candidates = [index for index in (object_start, array_start) if index >= 0]
+    if not start_candidates:
+        return text
+    start = min(start_candidates)
+    opening = text[start]
+    closing = "}" if opening == "{" else "]"
+    stack = []
     if start < 0:
         return text
-    depth = 0
     in_string = False
     escape = False
     for idx in range(start, len(text)):
@@ -352,21 +411,129 @@ def extract_first_json_object(text: str) -> str:
             continue
         if ch == '"':
             in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or ch != stack[-1]:
+                return text[start:]
+            stack.pop()
+            if not stack and ch == closing:
                 return text[start : idx + 1]
     return text[start:]
 
 
-def safe_json_loads(text: str) -> Tuple[Dict[str, object], str]:
-    candidate = extract_first_json_object(text)
+def extract_first_json_object(text: str) -> str:
+    return extract_first_json_value(text)
+
+
+def safe_json_loads_any(text: str) -> Tuple[object, str]:
+    candidate = extract_first_json_value(text)
     try:
         return json.loads(candidate), ""
     except json.JSONDecodeError as exc:
-        return {}, str(exc)
+        return None, str(exc)
+
+
+def safe_json_loads(text: str) -> Tuple[Dict[str, object], str]:
+    payload, error = safe_json_loads_any(text)
+    if isinstance(payload, dict):
+        return payload, ""
+    if payload is None:
+        return {}, error
+    return {}, f"Expected top-level JSON object, got {type(payload).__name__}"
+
+
+def normalize_trace_prediction_payload(payload: object) -> Dict[str, object]:
+    if isinstance(payload, dict) and "per_criterion_draft" in payload:
+        return evidence_trace_from_step2(payload)
+
+    raw_entries = []
+    overall_source = ""
+    if isinstance(payload, list):
+        raw_entries = payload
+    elif isinstance(payload, dict):
+        overall_source = payload.get("overall_likelihood", "")
+        if isinstance(payload.get("per_criterion"), list):
+            raw_entries = payload["per_criterion"]
+        elif isinstance(payload.get("criterion"), str):
+            raw_entries = [payload]
+        else:
+            direct_entries = []
+            for criterion in CRITERIA:
+                if criterion in payload:
+                    direct_entries.append(
+                        {
+                            "criterion": criterion,
+                            "score": payload.get(criterion),
+                            "evidence": payload.get("evidence", DEFAULT_EVIDENCE),
+                            "support_type": payload.get("support_type", "unsupported"),
+                            "holmes_span": payload.get("holmes_span", ""),
+                            "artifact_taxonomy": payload.get("artifact_taxonomy", "none"),
+                            "non_applicable": payload.get("non_applicable", False),
+                            "artifact_score_conflict": payload.get("artifact_score_conflict", False),
+                        }
+                    )
+            raw_entries = direct_entries
+    else:
+        return {}
+
+    entry_map: Dict[str, Dict[str, object]] = {}
+    any_positive = False
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        criterion = canonicalize_criterion(entry.get("criterion", ""))
+        if criterion not in CRITERIA or criterion in entry_map:
+            continue
+        score = teacher_entry_score(entry)
+        evidence = clean_text(entry.get("evidence", "")) or DEFAULT_EVIDENCE
+        support_type = clean_text(entry.get("support_type", "")) or "unsupported"
+        holmes_span = clean_text(entry.get("holmes_span", ""))
+        artifact_taxonomy = clean_text(entry.get("artifact_taxonomy", "")) or infer_artifact_taxonomy(
+            criterion,
+            evidence,
+            score,
+        )
+        entry_map[criterion] = {
+            "criterion": criterion,
+            "score": score,
+            "evidence": evidence,
+            "support_type": support_type,
+            "holmes_span": holmes_span,
+            "artifact_taxonomy": artifact_taxonomy,
+            "non_applicable": bool(entry.get("non_applicable", evidence == DEFAULT_EVIDENCE)),
+            "artifact_score_conflict": bool(
+                entry.get("artifact_score_conflict", score == 1 and evidence == DEFAULT_EVIDENCE)
+            ),
+        }
+        if score:
+            any_positive = True
+
+    if not entry_map:
+        return {}
+
+    normalized_entries = []
+    for criterion in CRITERIA:
+        normalized_entries.append(
+            entry_map.get(
+                criterion,
+                {
+                    "criterion": criterion,
+                    "score": 0,
+                    "evidence": DEFAULT_EVIDENCE,
+                    "support_type": "unsupported",
+                    "holmes_span": "",
+                    "artifact_taxonomy": "none",
+                    "non_applicable": True,
+                    "artifact_score_conflict": False,
+                },
+            )
+        )
+
+    overall = normalize_label(overall_source)
+    if overall == UNCERTAIN_LABEL:
+        overall = FAKE_LABEL if any_positive else REAL_LABEL
+    return {"overall_likelihood": overall, "per_criterion": normalized_entries}
 
 
 # Legacy alias kept so older code paths can continue to import the prior name.

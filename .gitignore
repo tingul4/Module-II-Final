@@ -8,4 +8,5 @@ student/experts/
 student/reports/
 student/merged_models/
 student/mobile_artifacts/
-teacher/derived_deterministic_v1/
+teacher/derived_deterministic_v1/*
+!teacher/derived_deterministic_v1/derived_split.json

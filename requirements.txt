@@ -1,0 +1,20 @@
+# Shared runtime packages used across the active student stack.
+# Install CUDA-matched `torch` separately via conda or the vendor wheel index.
+
+# Common: train / eval / inference / deploy
+accelerate==1.11.0
+Pillow>=10.0.0
+peft==0.19.0
+PyYAML>=6.0,<7
+transformers==5.9.0
+torchvision==0.24.0
+
+# Training + evaluation
+bitsandbytes>=0.48,<1
+
+# Evaluation-only explanatory metrics
+nltk>=3.9,<4
+rouge-score>=0.1.2,<1
+
+# Deployment-only LiteRT export
+litert-torch==0.9.1

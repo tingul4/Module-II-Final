@@ -4,18 +4,29 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
-from PIL import Image
 
-from model_utils import load_image_text_model, load_processor, move_inputs_to_generation_device, prepare_generation_inputs
-from task_utils import (
-    DEFAULT_EVIDENCE,
+from detectors.holmes_clip_lora.runtime import (
+    DEFAULT_THRESHOLD,
+    default_checkpoint_path,
+    load_detector,
+    prediction_payload,
+    score_single_image,
+)
+from utils.model_utils import (
+    load_image_text_model,
+    load_processor,
+    move_inputs_to_generation_device,
+    prepare_generation_inputs,
+)
+from utils.task_utils import (
     compact_json_dumps,
     compact_trace_payload,
-    extract_first_json_object,
+    extract_first_json_value,
     normalize_final_prediction_payload,
+    normalize_trace_prediction_payload,
     safe_json_loads,
+    safe_json_loads_any,
 )
-from visual_expert import predict_visual_expert
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,8 +38,10 @@ def parse_args():
     parser.add_argument("--adapter_path", type=str, required=True)
     parser.add_argument("--image_path", type=str, required=True)
     parser.add_argument("--prompt_dir", type=str, default=str(REPO_ROOT / "prompts"))
-    parser.add_argument("--expert_path", type=str, default=None)
-    parser.add_argument("--fusion_alpha", type=float, default=0.8)
+    parser.add_argument("--prediction_source", choices=("student", "detector_student"), default="detector_student")
+    parser.add_argument("--detector_checkpoint_path", type=str, default=default_checkpoint_path())
+    parser.add_argument("--detector_clip_weights", type=str, default=None)
+    parser.add_argument("--detector_threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--max_new_tokens_trace", type=int, default=1536)
     parser.add_argument("--max_new_tokens_json", type=int, default=1024)
     parser.add_argument("--local_files_only", action="store_true")
@@ -62,7 +75,7 @@ def generate_text(model, processor, image_path: str, prompt_text: str, max_new_t
     inputs = move_inputs_to_generation_device(model, inputs)
     with torch.no_grad():
         generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-        trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+        trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = processor.batch_decode(
             trimmed,
             skip_special_tokens=True,
@@ -71,15 +84,26 @@ def generate_text(model, processor, image_path: str, prompt_text: str, max_new_t
     return output_text[0]
 
 
-def generate_trace_payload(model, processor, image_path: str, prompt_text: str, max_new_tokens: int):
+def generate_trace_payload(
+    model,
+    processor,
+    image_path: str,
+    prompt_text: str,
+    max_new_tokens: int,
+    retry_token_cap: int | None = None,
+):
     trace_text = generate_text(model, processor, image_path, prompt_text, max_new_tokens=max_new_tokens)
-    trace_json, trace_parse_error = safe_json_loads(trace_text)
+    trace_payload, trace_parse_error = safe_json_loads_any(trace_text)
+    trace_json = normalize_trace_prediction_payload(trace_payload)
     retry_used = False
-    retry_budget = min(2048, max(max_new_tokens + 512, int(max_new_tokens * 1.5)))
+    retry_budget = min(3072, max(max_new_tokens + 1024, int(max_new_tokens * 2.0)))
+    if retry_token_cap is not None:
+        retry_budget = min(retry_budget, int(retry_token_cap))
     if not trace_json and retry_budget > max_new_tokens:
         retry_used = True
         retry_text = generate_text(model, processor, image_path, prompt_text, max_new_tokens=retry_budget)
-        retry_json, retry_error = safe_json_loads(retry_text)
+        retry_payload, retry_error = safe_json_loads_any(retry_text)
+        retry_json = normalize_trace_prediction_payload(retry_payload)
         if retry_json or len(retry_text) >= len(trace_text):
             trace_text = retry_text
             trace_json = retry_json
@@ -87,30 +111,28 @@ def generate_trace_payload(model, processor, image_path: str, prompt_text: str, 
     if trace_json:
         trace_for_final = compact_json_dumps(compact_trace_payload(trace_json))
     else:
-        trace_for_final = extract_first_json_object(trace_text)
+        trace_for_final = extract_first_json_value(trace_text)
     return trace_text, trace_json, trace_parse_error, trace_for_final, retry_used
 
 
-def apply_expert_fusion(final_json: dict, expert_path: str, image_path: str, fusion_alpha: float) -> dict:
-    if not expert_path or not final_json:
-        return final_json
-    expert_path = Path(expert_path)
-    if expert_path.is_dir():
-        expert_path = expert_path / "expert.pt"
-    image = Image.open(image_path).convert("RGB")
-    _, criterion_probs = predict_visual_expert(expert_path, image)
-    per_criterion = final_json.get("per_criterion", [])
-    any_positive = False
-    for idx, entry in enumerate(per_criterion):
-        student_score = 1 if int(entry.get("aigc score", 0) or 0) else 0
-        expert_prob = float(criterion_probs[idx])
-        fused_score = 1 if fusion_alpha * student_score + (1.0 - fusion_alpha) * expert_prob >= 0.5 else 0
-        if student_score == 0 and fused_score == 1 and entry.get("evidence", DEFAULT_EVIDENCE) == DEFAULT_EVIDENCE:
-            fused_score = 0
-        entry["aigc score"] = fused_score
-        any_positive = any_positive or bool(fused_score)
-    final_json["overall_likelihood"] = "AI-Generated" if any_positive else "Real"
-    return final_json
+def build_final_prompt(final_json_prompt: str, trace_for_final: str) -> str:
+    return (
+        f"{final_json_prompt}\n\n"
+        "Here is the structured evidence trace for this image:\n"
+        f"{trace_for_final}\n\n"
+        "Use the trace to synthesize the final structured decision JSON."
+    )
+
+
+def overlay_detector_label(final_json: dict, detector_meta: dict) -> dict:
+    final_json = normalize_final_prediction_payload(final_json)
+    result = dict(final_json)
+    result["student_overall_likelihood"] = final_json.get("overall_likelihood")
+    result["overall_likelihood"] = detector_meta["detector_label"]
+    result["detector_score"] = detector_meta["detector_score"]
+    result["detector_threshold"] = detector_meta["detector_threshold"]
+    result["detector_label"] = detector_meta["detector_label"]
+    return result
 
 
 def main():
@@ -125,26 +147,31 @@ def main():
         evidence_trace_prompt,
         max_new_tokens=args.max_new_tokens_trace,
     )
-    final_prompt = (
-        f"{final_json_prompt}\n\n"
-        "Here is the structured evidence trace for this image:\n"
-        f"{trace_for_final}\n\n"
-        "Use the trace to synthesize the final structured decision JSON."
-    )
     final_json_text = generate_text(
         model,
         processor,
         args.image_path,
-        final_prompt,
+        build_final_prompt(final_json_prompt, trace_for_final),
         max_new_tokens=args.max_new_tokens_json,
     )
 
     final_json, parse_error = safe_json_loads(final_json_text)
+    detector_meta = None
+    if args.prediction_source == "detector_student":
+        bundle = load_detector(
+            args.detector_checkpoint_path,
+            args.detector_clip_weights,
+            threshold=args.detector_threshold,
+        )
+        score = score_single_image(bundle, args.image_path)
+        detector_meta = prediction_payload(score, bundle.threshold)
     if final_json:
-        final_json = apply_expert_fusion(final_json, args.expert_path, args.image_path, args.fusion_alpha)
         final_json = normalize_final_prediction_payload(final_json)
+        if args.prediction_source == "detector_student":
+            final_json = overlay_detector_label(final_json, detector_meta)
 
     result = {
+        "prediction_source": args.prediction_source,
         "evidence_trace_text": evidence_trace_text,
         "evidence_trace_json": trace_json,
         "evidence_trace_parse_error": trace_parse_error,
@@ -152,6 +179,7 @@ def main():
         "final_json_text": final_json_text,
         "final_json": final_json,
         "parse_error": parse_error,
+        "detector": detector_meta,
     }
     if args.output_path:
         with open(args.output_path, "w", encoding="utf-8") as handle:
