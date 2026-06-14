@@ -2,8 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_GEMMA4_CHAT_TEMPLATE_SOURCE = "google/gemma-4-E2B-it"
 DEFAULT_GEMMA4_VISION_MAX_SOFT_TOKENS = 280
 
@@ -42,7 +41,7 @@ export(
 If the split `.tflite` files already exist but `model.litertlm` must be rebuilt, run:
 
 ```bash
-python3 student/src/export_litert_model.py \
+python3 student/src/deployment/export_litert_model.py \
   --merged_model_dir {merged_model_dir} \
   --output_dir {output_dir} \
   --tflite_model {base_tflite_arg}
@@ -335,13 +334,13 @@ def maybe_package_litert_lm(args, outputs):
 def validate_outputs(args, outputs):
     if args.dry_run:
         return
-    if outputs["base_model"] is None:
-        raise RuntimeError(
-            "LiteRT export did not produce a base model (.tflite). Check the packaging environment and export logs."
-        )
     if args.bundle_litert_lm and outputs["litert_lm"] is None:
         raise RuntimeError(
             "LiteRT export completed but model.litertlm is missing after bundling."
+        )
+    if not args.bundle_litert_lm and outputs["base_model"] is None:
+        raise RuntimeError(
+            "LiteRT export did not produce a base model (.tflite). Check the packaging environment and export logs."
         )
 
 

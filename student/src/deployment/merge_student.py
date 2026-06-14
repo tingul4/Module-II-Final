@@ -1,10 +1,15 @@
 import argparse
+import sys
 from pathlib import Path
 
-from model_utils import merge_lora_adapter
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from utils.model_utils import merge_lora_adapter
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def parse_args():
