@@ -8,7 +8,7 @@ This repository trains a compact student vision-language model that inspects one
 - Training path: Holmes-derived deterministic multi-task QLoRA SFT
 - Deployment path: `HF fine-tune -> merge -> .litertlm`
 - Secondary artifact: merged Hugging Face model directory for local validation and conversion
-- Reports: every new report path must emit **HTML**; JSON sidecars are optional machine-readable companions
+- Reports: every new report path must emit **Markdown**; JSON sidecars are optional machine-readable companions
 
 Do not add new active-path naming that reintroduces `lpcvc`, `competition`, `qwen`, `qualcomm`, `onnx`, `qnn`, or `aimet`. Legacy filenames may remain when they point to already-generated data.
 
@@ -42,22 +42,17 @@ Score semantics:
 ## Repository Layout
 
 - `teacher/`: Holmes supervision conversion and derived-data builder
-- `student/`: Gemma student training, inference, evaluation, visual expert, and deployment helpers
+- `student/`: Gemma student training, detector integration, inference, evaluation, and deployment helpers
 - `prompts/`: final JSON, evidence trace, taxonomy, and consistency prompts
-- `run_eda.py`: repo-relative dataset EDA utility
 
 Important active files:
 
 - `student/src/train.py`
 - `student/src/inference.py`
 - `student/src/evaluate.py`
-- `student/src/merge_student.py`
-- `student/src/export_litert_model.py`
-- `student/src/task_utils.py`
-
-Legacy compatibility file:
-
-- `student/src/lpcvc_utils.py`: shim only; new code should import `task_utils`
+- `student/src/deployment/merge_student.py`
+- `student/src/deployment/export_litert_model.py`
+- `student/src/utils/task_utils.py`
 
 ## Data Sources
 
@@ -213,14 +208,6 @@ python3 student/src/train.py \
   --sample_eval_rows 2
 ```
 
-Visual expert training:
-
-```bash
-python3 student/src/train_visual_expert.py \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --output_dir student/experts/default
-```
-
 Inference:
 
 ```bash
@@ -241,25 +228,10 @@ python3 student/src/evaluate.py \
   --prompt_dir prompts
 ```
 
-Detector-only slice evaluation on Blackwell must use a version-compatible PyTorch environment:
-
-```bash
-./.venv-google-ai-edge/bin/python student/src/run_clip_detector_eval.py \
-  --device cuda:1 \
-  --row_ids_path student/outputs/gemma4_lightweight_eval/eval_slice_row_ids.txt \
-  --output_root student/outputs/gemma4_lightweight_eval \
-  --output_prefix detector_clip_lora_gpu
-```
-
-Detector/Gemma fusion analysis:
-
-```bash
-./.venv-google-ai-edge/bin/python student/src/analyze_detector_fusion.py \
-  --detector_scores_path student/outputs/gemma4_lightweight_eval/detector_clip_lora_gpu.jsonl \
-  --gemma_predictions_path student/outputs/gemma4_lightweight_eval/predictions/ckpt4000_single_stage.jsonl \
-  --output_root student/outputs/gemma4_lightweight_eval \
-  --output_prefix detector_fusion_analysis
-```
+Detector-first evaluation uses the main evaluator with `--prediction_source detector`
+or `--prediction_source detector_student`. The vendored CLIP LoRA checkpoint lives
+under `student/outputs/detectors/holmes_clip_lora_vitl14_336/`, while the base CLIP
+`ViT-L-14-336px.pt` path is supplied explicitly at runtime.
 
 Legacy baseline:
 
@@ -271,7 +243,7 @@ Training evaluation artifacts:
 
 - `training.log`: persistent optimizer/progress metrics
 - `training_eval/step_<N>.json`: fixed-step sample evaluation JSON
-- `training_eval/step_<N>.html`: fixed-step sample evaluation HTML
+- `training_eval/step_<N>.md`: fixed-step sample evaluation Markdown
 
 ## Deployment Pipeline
 
@@ -288,21 +260,21 @@ The official repo deployment path is:
 Packaging environment requirements:
 
 - Use `uv venv .venv-google-ai-edge --python 3.11`
-- Install `student/deployment/requirements.txt`
+- Install repo-root `requirements.txt`
 - Run packaging commands with `PYTHONNOUSERSITE=1`
 - Keep packaging and training environments separate
 
 Deployment CLIs:
 
 ```bash
-python3 student/src/merge_student.py \
+python3 student/src/deployment/merge_student.py \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --output_dir student/merged_models/gemma4_e2b_latest
 ```
 
 ```bash
-python3 student/src/export_litert_model.py \
+python3 student/src/deployment/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
   --prefill_seq_len 128 \
@@ -316,14 +288,16 @@ End-to-end packaging flow:
 ```bash
 uv venv .venv-google-ai-edge --python 3.11
 source .venv-google-ai-edge/bin/activate
-uv pip install -r student/deployment/requirements.txt
-PYTHONNOUSERSITE=1 python student/src/merge_student.py \
+uv pip install -r requirements.txt
+PYTHONNOUSERSITE=1 python student/src/deployment/merge_student.py \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --output_dir student/merged_models/gemma4_e2b_latest
-PYTHONNOUSERSITE=1 python student/src/export_litert_model.py \
+PYTHONNOUSERSITE=1 python student/src/deployment/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
+  --quantize dynamic_wi8_afp32 \
+  --vision_quantize dynamic_wi8_afp32 \
   --prefill_seq_len 128 \
   --kv_cache_max_len 512 \
   --trust_remote_code \
@@ -331,6 +305,8 @@ PYTHONNOUSERSITE=1 python student/src/export_litert_model.py \
 ```
 
 `export_litert_model.py` is the active export CLI. It runs LiteRT export directly, writes a conversion recipe and export guide, and ensures the output workspace contains `model.litertlm` plus the split LiteRT `.tflite` assets required by the runtime path.
+
+For Android smoke testing, prefer the `dynamic_wi8_afp32` memory-friendly artifact path before trying smaller weight-only exports. The 4-bit weight-only artifact is useful for file-size comparison, but it can increase runtime memory pressure through explicit float dequantization.
 
 ## Phase Status
 
@@ -342,8 +318,8 @@ Status legend:
 
 - `[x]` Holmes-derived deterministic dataset builder exists
 - `[x]` Multi-task student pipeline exists
-- `[x]` Visual expert training hooks exist
-- `[x]` HTML report generation is wired into evaluation/report workflows
+- `[x]` Detector-first Gemma + CLIP LoRA architecture is wired into the active student stack
+- `[x]` Markdown report generation is wired into evaluation/report workflows
 - `[x]` Active backbone switched to Gemma 4 E2B in code and docs
 - `[x]` Merge and LiteRT export helper CLIs added
 - `[x]` Gradient-path fix validated for Gemma 4 E2B QLoRA (`use_reentrant=False` plus post-PEFT input-gradient hook)
@@ -364,13 +340,14 @@ Syntax check:
 python3 -m py_compile \
   teacher/convert_holmes_sft.py \
   teacher/build_derived_dataset.py \
-  student/src/task_utils.py \
-  student/src/model_utils.py \
+  student/src/utils/task_utils.py \
+  student/src/utils/model_utils.py \
   student/src/train.py \
   student/src/inference.py \
   student/src/evaluate.py \
-  student/src/merge_student.py \
-  student/src/export_litert_model.py
+  student/src/deployment/merge_student.py \
+  student/src/deployment/export_litert_model.py \
+  student/src/detectors/holmes_clip_lora/train.py
 ```
 
 Packaging environment build:
@@ -378,7 +355,7 @@ Packaging environment build:
 ```bash
 uv venv .venv-google-ai-edge --python 3.11
 source .venv-google-ai-edge/bin/activate
-uv pip install -r student/deployment/requirements.txt
+uv pip install -r requirements.txt
 ```
 
 ## Known Gaps
@@ -388,6 +365,7 @@ uv pip install -r student/deployment/requirements.txt
 - On this workstation, Android export requires a clean isolated `uv` environment. Mixed user-site packages can break LiteRT export even when the model weights are healthy.
 - The current Hugging Face Gemma 4 E2B snapshot available locally exposes `tokenizer.json`; the active export path packages tokenizer assets directly from the merged model directory.
 - This workstation can validate `.litertlm` creation and inspect exported LiteRT files, but does not provide a local multimodal MediaPipe runtime equivalent to the Android app path.
+- Android smoke tests should pin `com.google.ai.edge.litertlm:litertlm-android` to a known version, start with CPU text and vision backends, set `maxNumTokens` to the exported metadata budget, and verify the Gemma 4 multimodal prompt template before testing GPU.
 - Full evaluation remains expensive because the pipeline performs two generations per sample plus optional probes.
 - On this workstation, the failure mode is environment-specific, not model-specific: the system `python3` path uses `torch 1.13.1+cu117`, which does not support Blackwell `sm_120` and can return all-zero CUDA results even for basic ops such as `matmul`, `conv`, and `sigmoid`. Do not trust detector GPU results from that environment.
 - A version-compatible PyTorch build is required for Blackwell GPU validation. The local `.venv-google-ai-edge` environment uses `torch 2.9.0+cu128`, advertises `sm_120`, and reproduces the `AIGI-Holmes` CLIP LoRA detector scores on GPU within numerical tolerance of the CPU reference.
@@ -399,4 +377,4 @@ uv pip install -r student/deployment/requirements.txt
 - Preserve legacy dataset filenames when renaming would break existing artifacts.
 - When changing prompts, do not change criterion order or output keys.
 - When changing training loops or callbacks, preserve persisted progress visibility in `training.log`.
-- Every new report-producing path must write HTML output; add JSON only as a companion artifact when useful.
+- Every new report-producing path must write Markdown output; add JSON only as a companion artifact when useful.

@@ -13,7 +13,7 @@ Use a dedicated `uv` environment for merge validation and LiteRT packaging. Do n
 ```bash
 uv venv .venv-google-ai-edge --python 3.11
 source .venv-google-ai-edge/bin/activate
-uv pip install -r student/deployment/requirements.txt
+uv pip install -r requirements.txt
 ```
 
 This environment is for:
@@ -38,7 +38,7 @@ For Android app integration, prepare:
 3. Merge the selected adapter:
 
 ```bash
-python3 student/src/merge_student.py \
+python3 student/src/deployment/merge_student.py \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --output_dir student/merged_models/gemma4_e2b_latest
@@ -72,7 +72,7 @@ Do not treat a raw Hugging Face `apply_chat_template()` snippet as a stable Andr
 
 ```bash
 source .venv-google-ai-edge/bin/activate
-PYTHONNOUSERSITE=1 python student/src/export_litert_model.py \
+PYTHONNOUSERSITE=1 python student/src/deployment/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
   --prefill_seq_len 128 \
@@ -110,13 +110,49 @@ Use the trace to synthesize the final structured decision JSON.
 
 If the app wants a human-readable report paragraph or table, render it from the final JSON in the app layer. Do not switch the model prompt to free-form prose if you need parity with training and evaluation.
 
-## Experimental Minimal Artifact Export
+## Android Memory-Friendly Artifact Export
 
-On this workstation, the closest result to the official LiteRT community E2B artifact size came from a 4-bit weight-only export:
+For Android smoke testing, prefer the runtime-memory-oriented `dynamic_wi8_afp32`
+export over the smaller `weight_only_wi4_afp32` artifact. The `dynamic_wi8`
+recipe uses integer compute, while the weight-only int4 recipe stores a smaller
+file but explicitly dequantizes weights into float compute at runtime.
 
 ```bash
 source .venv-google-ai-edge/bin/activate
-PYTHONNOUSERSITE=1 python student/src/export_litert_model.py \
+PYTHONNOUSERSITE=1 python student/src/deployment/export_litert_model.py \
+  --merged_model_dir student/merged_models/gemma4_e2b_round1_checkpoint4000 \
+  --output_dir student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_memory_dynamic_wi8 \
+  --quantize dynamic_wi8_afp32 \
+  --vision_quantize dynamic_wi8_afp32 \
+  --prefill_seq_len 128 \
+  --kv_cache_max_len 512 \
+  --trust_remote_code
+```
+
+The safest first smoke-test remains `Backend.CPU()` for both text and vision,
+`maxNumTokens = 512`, and `maxNumImages = 1`. The current Android app in
+`/ssd4/LPCVC2026/bk/mobile/NYCU_2026_module_final_project` now defaults to a
+more practical hybrid path: `Backend.GPU()` for text decode plus
+`visionBackend = Backend.CPU()` for single-image vision, with automatic fallback
+to `CPU/CPU` if the GPU text backend fails to initialize. Pin
+`com.google.ai.edge.litertlm:litertlm-android` to `0.12.0` during testing so all
+machines use the same runtime. Clear the app cache after replacing a `.litertlm`
+file, and collect `adb shell dumpsys activity exit-info com.example.aigi_dectector`
+plus `adb shell dumpsys meminfo com.example.aigi_dectector` if Android kills the
+process again.
+
+Measured output from this export:
+
+- `model.litertlm`: `5,237,968,096` bytes, about `5.24 GB` decimal
+
+## Experimental Small-File Artifact Export
+
+On this workstation, the closest result to the official LiteRT community E2B
+artifact size came from a 4-bit weight-only export:
+
+```bash
+source .venv-google-ai-edge/bin/activate
+PYTHONNOUSERSITE=1 python student/src/deployment/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_round1_checkpoint4000 \
   --output_dir student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_minimal_wi4 \
   --quantize weight_only_wi4_afp32 \
@@ -136,13 +172,18 @@ Measured outputs from that export:
 - `vision_encoder_quantized.tflite`: `87,783,184` bytes
 - `vision_adapter_quantized.tflite`: `619,328` bytes
 
-This is close to the current official LiteRT community Gemma 4 E2B size band. The earlier `dynamic_wi8_afp32` export produced a much larger `model.litertlm` at about `5.24 GB`.
+This is close to the current official LiteRT community Gemma 4 E2B size band, but
+it is not the recommended first Android runtime test artifact because
+`weight_only_wi4_afp32` can increase runtime memory pressure through explicit
+float dequantization. In practice, that means the 4-bit artifact is optimized
+for storage size, while the `dynamic_wi8_afp32` artifact is optimized for lower
+deployment-side RAM pressure.
 
 ## Notes
 
 - The current public LiteRT path for Gemma export is Hugging Face -> split LiteRT `.tflite` assets -> `model.litertlm`.
 - The export helper in this repo resolves tokenizer assets directly from the merged Hugging Face model directory and does not require an external SentencePiece asset.
-- The regenerated deployment candidate artifact should live at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000/model.litertlm`.
+- The recommended Android smoke-test artifact should live at `student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_memory_dynamic_wi8/model.litertlm`.
 - On this workstation, validation is export-level: generate the split LiteRT files and `model.litertlm`, then hand the artifact set to Android integration. A local Python multimodal MediaPipe runtime is not available here.
 - Use `--keep_temporary_files` only when you need to inspect raw and quantized `.tflite` outputs. Omit it for the smallest shippable export workspace.
 - If LiteRT Torch prints a warning about C++ extensions because of the installed `torch` build, treat it as an environment issue, not a model-quality issue. Rebuild the packaging env before suspecting the adapter weights.

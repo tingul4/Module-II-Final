@@ -132,6 +132,20 @@ The builder accepts both:
 
 No new teacher, judge, or specialist model is called in this step. It deterministically converts teacher outputs into student-side multitask supervision.
 
+## Teacher Baseline Evaluation
+
+The student evaluator can score teacher outputs directly on the same held-out split used for student checkpoints.
+This baseline reads `step2_internal`, falling back to `step2_draft`, then normalizes the teacher row into the same canonical evaluation surface used for student predictions.
+
+```bash
+python3 student/src/evaluate.py \
+  --prediction_source teacher \
+  --teacher_jsonl_path teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --split eval \
+  --output_path student/outputs/teacher_eval.json
+```
+
 ## Pipeline Modes
 
 `convert_holmes_sft.py` supports:

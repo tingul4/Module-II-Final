@@ -1,19 +1,25 @@
 # Student Model Pipeline
 
-This folder contains the active student-side pipeline for Holmes-derived AI image authenticity reasoning. The active backbone is **`google/gemma-4-E2B-it`**. Older `Qwen` runs remain in `outputs/` as historical baselines only.
+This folder contains the active student-side stack for Holmes-derived AI image authenticity:
+
+- `Gemma 4 E2B` multi-task SFT for evidence / taxonomy / consistency / final JSON
+- `CLIP LoRA detector` for binary real-vs-AI classification
+
+The active detector-first policy is:
+
+1. detector decides `overall_likelihood`
+2. Gemma produces the structured explanation payload
 
 ## Components
 
 - `src/train.py`: multi-task QLoRA trainer
-- `src/inference.py`: two-stage image-to-JSON inference CLI
-- `src/evaluate.py`: offline evaluation plus HTML report output
-- `src/train_visual_expert.py`: handcrafted-feature visual expert trainer
-- `src/visual_expert.py`: visual expert feature extraction and inference helpers
-- `src/merge_student.py`: LoRA merge helper
-- `src/export_litert_model.py`: LiteRT split-model + `.litertlm` export CLI
-- `src/task_utils.py`: active task/schema helpers
-- `src/lpcvc_utils.py`: legacy compatibility shim
-- `finetune.sh`: convenience wrapper
+- `src/inference.py`: two-stage inference CLI, with optional `detector_student` mode
+- `src/evaluate.py`: held-out evaluation for `student`, `teacher`, `detector`, and `detector_student`
+- `src/utils/`: shared schema, split, and model helpers
+- `src/detectors/holmes_clip_lora/`: vendored Holmes CLIP LoRA detector code
+- `src/deployment/merge_student.py`: LoRA merge helper
+- `src/deployment/export_litert_model.py`: LiteRT split-model + `.litertlm` export CLI
+- `outputs/detectors/holmes_clip_lora_vitl14_336/`: detector config + checkpoint artifact
 
 ## Training Data
 
@@ -23,19 +29,12 @@ Primary input:
 teacher/derived_deterministic_v1/derived.jsonl
 ```
 
-Each row provides:
+The train/eval split is persisted beside the derived dataset as `derived_split.json` by default.
+The active default is a deterministic stratified `90/10` split on `final_json_target.overall_likelihood`.
 
-- `final_json_target`
-- `evidence_trace_target`
-- `taxonomy_target`
-- `consistency_target`
-- `quality_flags`
+## Student Training
 
-Images remain relative to the original teacher dataset through `image` + `image_root`.
-
-## Training Behavior
-
-The dataset deterministically re-samples one task per row per epoch:
+The multi-task SFT dataset deterministically re-samples one task per row per epoch:
 
 - `final_json`
 - `evidence_trace`
@@ -48,27 +47,7 @@ Recommended task mix:
 --task_mix '{"final_json":0.4,"evidence_trace":0.35,"taxonomy_classification":0.15,"consistency_check":0.1}'
 ```
 
-The student keeps the current multi-task QLoRA design:
-
-- 4-bit NF4 loading
-- LoRA adapters
-- attention + MLP projection targets
-- `bf16`
-- gradient checkpointing
-- `paged_adamw_8bit`
-- optional visual expert distillation via `--visual_expert_path`
-- fixed-step sample evaluation reports during training via `training_eval/step_<N>.{json,html}`
-
-## Active Backbone Policy
-
-- Active backbone: `google/gemma-4-E2B-it`
-- Historical baseline: `student/outputs/20260427_105054/checkpoint-7014`
-- Do not initialize new training runs from old adapters
-- `--resume_from_checkpoint` means same-run continuation only
-
-The model loader is now Gemma-first and uses a generic image-text path instead of Qwen-specific branching.
-
-## Train
+Train:
 
 ```bash
 cd /ssd4/LPCVC2026/Module-II-Final
@@ -83,6 +62,13 @@ python3 student/src/train.py \
   --sample_eval_steps 500 \
   --sample_eval_rows 4
 ```
+
+Relevant split flags:
+
+- `--eval_ratio 0.1`
+- `--split_seed 42`
+- `--split_manifest_path <optional custom path>`
+- `--regenerate_split`
 
 Smoke run:
 
@@ -102,34 +88,36 @@ python3 student/src/train.py \
   --sample_eval_rows 2
 ```
 
-Wrapper script:
+## Detector
 
-```bash
-cd /ssd4/LPCVC2026/Module-II-Final/student
-./finetune.sh --batch_size 2 --epochs 3
+Detector artifact root:
+
+```text
+student/outputs/detectors/holmes_clip_lora_vitl14_336/
 ```
 
-## Visual Expert
+Included in-repo:
+
+- `config_train.yaml`
+- `checkpoints/model_epoch_0.94_0.99.pth`
+
+Not vendored in-repo:
+
+- OpenAI CLIP base weights `ViT-L-14-336px.pt`
+
+You must provide the base CLIP weights path explicitly for detector evaluation or detector-student inference.
+
+Detector retraining CLI:
 
 ```bash
-python3 student/src/train_visual_expert.py \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --output_dir student/experts/default
-```
-
-Distillation round:
-
-```bash
-python3 student/src/train.py \
-  --model_name_or_path google/gemma-4-E2B-it \
-  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts \
-  --output_dir student/outputs \
-  --visual_expert_path student/experts/default/dataset_logits.jsonl \
-  --distill_weight 0.1
+python3 student/src/detectors/holmes_clip_lora/train.py \
+  --config student/outputs/detectors/holmes_clip_lora_vitl14_336/config_train.yaml \
+  --clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt
 ```
 
 ## Inference
+
+Student-only:
 
 ```bash
 python3 student/src/inference.py \
@@ -139,39 +127,107 @@ python3 student/src/inference.py \
   --prompt_dir prompts
 ```
 
-The pipeline is:
+Detector-first classification plus Gemma explanation:
 
-1. generate `evidence_trace`
-2. synthesize `final_json`
-3. optionally fuse visual expert scores
+```bash
+python3 student/src/inference.py \
+  --prediction_source detector_student \
+  --base_model google/gemma-4-E2B-it \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --image_path <image> \
+  --prompt_dir prompts \
+  --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
+  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_threshold 0.34
+```
+
+`detector_student` output includes:
+
+- `detector_score`
+- `detector_label`
+- `student_overall_likelihood`
+- final `overall_likelihood` overridden by the detector label
 
 ## Evaluation
 
+Install the shared project dependencies before running training, evaluation, or deployment tools:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m nltk.downloader wordnet omw-1.4
+```
+
+Student held-out eval:
+
 ```bash
 python3 student/src/evaluate.py \
+  --prediction_source student \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
-  --prompt_dir prompts
+  --prompt_dir prompts \
+  --split eval \
+  --output_path student/outputs/student_eval.json
 ```
 
-Evaluation writes HTML reports when `--output_path` is provided.
+Teacher baseline on the same held-out split:
+
+```bash
+python3 student/src/evaluate.py \
+  --prediction_source teacher \
+  --teacher_jsonl_path teacher/stage1_g31b_v5_full_balanced/holmes_lpcvc_sft.jsonl \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --split eval \
+  --output_path student/outputs/teacher_eval.json
+```
+
+Detector-only held-out eval:
+
+```bash
+python3 student/src/evaluate.py \
+  --prediction_source detector \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --split eval \
+  --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
+  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_threshold 0.34 \
+  --output_path student/outputs/detector_eval.json
+```
+
+Detector + student eval:
+
+```bash
+python3 student/src/evaluate.py \
+  --prediction_source detector_student \
+  --base_model google/gemma-4-E2B-it \
+  --adapter_path student/outputs/<run>/checkpoint-<step> \
+  --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
+  --prompt_dir prompts \
+  --split eval \
+  --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
+  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_threshold 0.34 \
+  --output_path student/outputs/detector_student_eval.json
+```
+
+Evaluation writes Markdown reports when `--output_path` is provided, alongside the JSON report file.
+
+Default explanatory metrics:
+
+- `BLEU-1`
+- `ROUGE-L`
+- `METEOR`
+
+Optional:
+
+- `CIDEr` via `--enable_cider` when the extra dependency is installed
 
 ## Deployment
-
-Primary deployment path:
-
-1. merge LoRA into a full HF model
-2. validate merged-model local inference
-3. export LiteRT split `.tflite` artifacts plus `model.litertlm`
-4. run on Android with MediaPipe LLM Inference API or another LiteRT-LM consumer
-
-The Android app-side inference contract should match `student/src/inference.py`: one stage with `prompts/evidence_trace.txt`, then one stage with `prompts/stage2.txt` plus the compacted stage-1 trace JSON. If you need a human-readable 8-criteria report, render it from the final JSON in the app layer.
 
 Merge:
 
 ```bash
-python3 student/src/merge_student.py \
+python3 student/src/deployment/merge_student.py \
   --base_model google/gemma-4-E2B-it \
   --adapter_path student/outputs/<run>/checkpoint-<step> \
   --output_dir student/merged_models/gemma4_e2b_latest
@@ -180,7 +236,7 @@ python3 student/src/merge_student.py \
 Prepare LiteRT export workspace:
 
 ```bash
-python3 student/src/export_litert_model.py \
+python3 student/src/deployment/export_litert_model.py \
   --merged_model_dir student/merged_models/gemma4_e2b_latest \
   --output_dir student/mobile_artifacts/gemma4_e2b \
   --dry_run
@@ -192,28 +248,3 @@ This writes:
 - `EXPORT_GUIDE.md`
 
 If split LiteRT `.tflite` files already exist, the same script can rebuild `model.litertlm`.
-
-For a smaller experimental mobile bundle, this repo has already validated:
-
-```bash
-python3 student/src/export_litert_model.py \
-  --merged_model_dir student/merged_models/gemma4_e2b_round1_checkpoint4000 \
-  --output_dir student/mobile_artifacts/gemma4_e2b_round1_checkpoint4000_minimal_wi4 \
-  --quantize weight_only_wi4_afp32 \
-  --vision_quantize weight_only_wi4_afp32 \
-  --prefill_seq_len 128 \
-  --kv_cache_max_len 512 \
-  --trust_remote_code \
-  --keep_temporary_files
-```
-
-That export produced a `model.litertlm` of about `2.64 GB` decimal, close to the official LiteRT community Gemma 4 E2B size range.
-
-## Notes
-
-- `student/merged_models/`, `student/mobile_artifacts/`, `student/reports/`, and `student/experts/` are generated artifacts.
-- Each active training run should start with a short smoke run before the long run.
-- Use `--max_steps` on smoke runs so they stay bounded and predictable.
-- Inspect `training.log` for loss, learning rate, grad norm, and ETA.
-- Inspect `training_eval/step_<N>.html` to compare prediction output against fixed-slice ground truth during training.
-- Legacy filenames and historical run folders may still contain `lpcvc` or `qwen`; treat them as old artifacts, not active architecture.
