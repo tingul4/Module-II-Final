@@ -29,6 +29,9 @@ class DetectorConfig:
 
     def apply_overrides(self, args: argparse.Namespace) -> None:
         overrides = {
+            "data.derived_data_path": getattr(args, "derived_data_path", None),
+            "data.split_manifest_path": getattr(args, "split_manifest_path", None),
+            "data.eval_ratio": getattr(args, "eval_ratio", None),
             "data.train_dataroot": getattr(args, "train_dataroot", None),
             "data.test_dataroot": getattr(args, "test_dataroot", None),
             "models.pretrained.clip_weights": getattr(args, "clip_weights", None),
@@ -38,6 +41,12 @@ class DetectorConfig:
             "training.niter": getattr(args, "epochs", None),
             "training.gpu_ids": getattr(args, "gpu_ids", None),
             "training.name": getattr(args, "run_name", None),
+            "training.log_interval": getattr(args, "log_interval", None),
+            "training.max_steps": getattr(args, "max_steps", None),
+            "training.split_seed": getattr(args, "split_seed", None),
+            "testing.batch_size": getattr(args, "val_batch_size", None),
+            "testing.threshold": getattr(args, "threshold", None),
+            "system.num_threads": getattr(args, "num_workers", None),
         }
         for key, value in overrides.items():
             if value not in (None, ""):
@@ -48,4 +57,3 @@ class DetectorConfig:
             yaml.safe_dump(self.payload, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
-
