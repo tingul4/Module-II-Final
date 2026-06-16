@@ -131,7 +131,7 @@ PYTHONNOUSERSITE=1 python student/src/deployment/export_litert_model.py \
 
 The safest first smoke-test remains `Backend.CPU()` for both text and vision,
 `maxNumTokens = 512`, and `maxNumImages = 1`. The current Android app in
-`/ssd4/LPCVC2026/bk/mobile/NYCU_2026_module_final_project` now defaults to a
+`../bk/mobile/NYCU_2026_module_final_project` now defaults to a
 more practical hybrid path: `Backend.GPU()` for text decode plus
 `visionBackend = Backend.CPU()` for single-image vision, with automatic fallback
 to `CPU/CPU` if the GPU text backend fails to initialize. Pin

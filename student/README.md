@@ -50,7 +50,6 @@ Recommended task mix:
 Train:
 
 ```bash
-cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
   --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
@@ -73,7 +72,6 @@ Relevant split flags:
 Smoke run:
 
 ```bash
-cd /ssd4/LPCVC2026/Module-II-Final
 python3 student/src/train.py \
   --model_name_or_path google/gemma-4-E2B-it \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
@@ -112,7 +110,7 @@ Detector retraining CLI:
 ```bash
 python3 student/src/detectors/holmes_clip_lora/train.py \
   --config student/outputs/detectors/holmes_clip_lora_vitl14_336/config_train.yaml \
-  --clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt
+  --clip_weights ../bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt
 ```
 
 ## Inference
@@ -137,7 +135,7 @@ python3 student/src/inference.py \
   --image_path <image> \
   --prompt_dir prompts \
   --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
-  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_clip_weights ../bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
   --detector_threshold 0.34
 ```
 
@@ -189,7 +187,7 @@ python3 student/src/evaluate.py \
   --derived_data_path teacher/derived_deterministic_v1/derived.jsonl \
   --split eval \
   --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
-  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_clip_weights ../bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
   --detector_threshold 0.34 \
   --output_path student/outputs/detector_eval.json
 ```
@@ -205,7 +203,7 @@ python3 student/src/evaluate.py \
   --prompt_dir prompts \
   --split eval \
   --detector_checkpoint_path student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth \
-  --detector_clip_weights /ssd4/LPCVC2026/bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
+  --detector_clip_weights ../bk/AIGI-Holmes/pretrained/clip/ViT-L-14-336px.pt \
   --detector_threshold 0.34 \
   --output_path student/outputs/detector_student_eval.json
 ```

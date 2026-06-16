@@ -59,7 +59,7 @@ Important active files:
 Expected Holmes source root:
 
 ```text
-/ssd4/LPCVC2026/dataset/holmes
+../dataset/holmes
 ```
 
 Local teacher dataset:
@@ -115,7 +115,7 @@ Typical draft-generation command:
 
 ```bash
 python3 teacher/convert_holmes_sft.py \
-  --holmes-root /ssd4/LPCVC2026/dataset/holmes \
+  --holmes-root ../dataset/holmes \
   --teacher-backend transformers_gemma4 \
   --model google/gemma-4-e2b-it \
   --pipeline-stage generator_only \

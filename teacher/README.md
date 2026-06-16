@@ -14,7 +14,7 @@ This folder builds Holmes-derived supervision for the student authenticity model
 Expected Holmes layout:
 
 ```text
-/ssd4/LPCVC2026/dataset/holmes/
+../dataset/holmes/
   SFTDATA.jsonl
   dataset_huggingface.zip
 ```
@@ -90,9 +90,8 @@ Teacher roles:
 Full multi-teacher generation is the default path:
 
 ```bash
-cd /ssd4/LPCVC2026/Module-II-Final
 python3 teacher/convert_holmes_sft.py \
-  --holmes-root /ssd4/LPCVC2026/dataset/holmes \
+  --holmes-root ../dataset/holmes \
   --teacher-backend transformers_gemma4 \
   --model google/gemma-4-31B-it \
   --judge-model google/gemma-4-31B-it \
