@@ -2212,10 +2212,10 @@ def normalize_judge_input_drafts(draft_entries_raw: object) -> List[Dict[str, ob
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert Holmes SFT data into Holmes-derived authenticity supervision JSONL.")
-    parser.add_argument("--holmes-root", type=Path, default=Path("/ssd4/LPCVC2026/dataset/holmes"))
+    parser.add_argument("--holmes-root", type=Path, default=REPO_ROOT.parent / "dataset" / "holmes")
     parser.add_argument("--input-jsonl", type=Path, default=None)
     parser.add_argument("--dataset-archive", type=Path, default=None)
-    parser.add_argument("--output-root", type=Path, default=Path("/ssd4/LPCVC2026/Module-II-Final/teacher/stage1_g31b_v5_full_balanced"))
+    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "teacher" / "stage1_g31b_v5_full_balanced")
     parser.add_argument("--output-jsonl", type=Path, default=None)
     parser.add_argument("--stats-path", type=Path, default=None)
     parser.add_argument("--draft-jsonl", type=Path, default=None)

@@ -9,7 +9,7 @@ from typing import Dict, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(REPO_ROOT / "student" / "src"))
 
-from task_utils import (
+from utils.task_utils import (
     consistency_target_from_trace,
     evidence_trace_from_step2,
     format_final_prediction_json,
