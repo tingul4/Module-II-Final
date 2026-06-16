@@ -715,26 +715,125 @@ uv pip install -r requirements.txt
 
 ## 7. Training Setup
 
-目前 student training 重要設定如下：
+這一節分成兩條訓練線來看：
 
-- base model: `Gemma 4 E2B`
-- training method: 4-bit QLoRA
+1. `Gemma multi-task SFT`
+2. `CLIP LoRA detector`
+
+兩者都使用同一份 derived supervision，並共享相同的 deterministic split manifest：
+
+- dataset: `teacher/derived_deterministic_v1/derived.jsonl`
+- split policy: stratified `90/10`
+- split seed: `42`
+- train rows: `28862`
+- eval rows: `3208`
+- split manifest: `teacher/derived_deterministic_v1/derived_split.json`
+
+### 7.1 Gemma Multi-task SFT Setup
+
+這條訓練線負責 explanation / structure generation。
+
+- initialization model: `student/merged_models/gemma4_e2b_round1_checkpoint4000`
+- effective backbone family: `Gemma 4 E2B`
+- training method: `4-bit QLoRA`
 - base weight quantization: `4-bit NF4`
 - LoRA target groups: attention projections + MLP projections
 - LoRA hyperparameters: `r=32`, `alpha=64`, `dropout=0.05`
 - precision: `bf16`
 - optimizer: `paged_adamw_8bit`
+- batch size: `1`
 - gradient accumulation: `8`
+- learning rate: `1e-4`
+- training epochs: `3`
 - task mix: `final_json 0.40 / evidence_trace 0.35 / taxonomy 0.15 / consistency 0.10`
 
-training-time eval 的設計如下：
+Gemma 的 validation / checkpoint 選擇方式如下：
 
-- train split 只用 `train_row_ids`
-- held-out 評估用 `eval_row_ids`
-- 每個 epoch 跑一次正式 evaluator
-- training-time checkpoint ranking 使用 balanced slice，比較不同 epoch 的 explanation-side quality
-- final binary classification 使用完整 eval split，不用 sample slice
-- explanation / structure metrics 使用 balanced `128` sample slice，也就是隨機抽 `64` 張 Real 與 `64` 張 AI-Generated
+- train split 僅使用 `train_row_ids`
+- 每個 epoch 結束後，對 held-out `eval` split 跑一次正式 `detector_student` evaluator
+- epoch-level formal eval 使用 balanced `64`-sample slice，`eval_slice_seed=42`
+- ranking priority 依序是：
+  - `overall_accuracy`
+  - `overall_macro_f1`
+  - `json_parse_rate`
+  - `rouge_l`
+  - `meteor`
+
+由於 `detector_student` 模式下 binary label 主要由 detector 覆蓋，正式 `epoch_001 / epoch_002 / epoch_003` 間的 `overall_accuracy` 與 `overall_macro_f1` 幾乎相同，因此實際把 checkpoint 拉開的是 explanation-side 指標。以正式 epoch eval 而言，本報告採用的 **best explanation checkpoint 是 `epoch_002`**，其主要依據是：
+
+- `json_parse_rate = 0.8594`
+- `criterion_macro_f1 = 0.4398`
+- `BLEU-1 = 0.5211`
+- `ROUGE-L = 0.4182`
+- `METEOR = 0.5428`
+
+也就是說，Gemma 這條線雖然總共訓練 `3` 個 epoch，但最終作為報告主體 explanation checkpoint 的是 **第 `2` 個 epoch**。
+
+### 7.2 CLIP LoRA Detector Setup
+
+這條訓練線負責最終 binary `Real / AI-Generated` classification。
+
+- detector backbone: `CLIP ViT-L/14@336px`
+- train mode: `LoRA`
+- CLIP base weights: `ViT-L-14-336px.pt`
+- learning rate: `5e-5`
+- train batch size: `32`
+- val batch size: `64`
+- training epochs: `4`
+- steps per epoch: `902`
+- total planned steps: `3608`
+- image resize / crop: `loadSize=384`, `cropSize=336`
+- data augmentation: enabled
+- random seed: `100`
+- split seed: `42`
+
+Detector 的 validation / checkpoint 選擇方式如下：
+
+- 每個 epoch 都在同一個 held-out `eval` split 上做 binary validation
+- training log 中同時記錄：
+  - `checkpoint_val_acc`
+  - `checkpoint_val_macro_f1`
+  - `checkpoint_val_ap`
+  - `checkpoint_best_f1_threshold`
+  - `checkpoint_best_f1`
+- **saved best checkpoint 的直接 selection signal 是 `checkpoint_val_macro_f1`，計算 threshold 固定為 `0.5`**
+- training 後另外再做 threshold calibration，發現同一顆 checkpoint 在 `threshold≈0.36` 時更適合作為最終 report / deployment operating point
+
+因此 detector 這條線要分成兩層理解：
+
+- checkpoint selection during training:
+  - 用 `macro_f1@0.5`
+- final operating point for reporting:
+  - 另外報 `@0.5` 與 `@0.36`
+
+最終被選中的 **best detector checkpoint 是第 `3` 個 epoch**：
+
+- checkpoint path:
+  - `student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/clip_lora_retrain_ckpt_repro_20260615_113122/model_best_f1_0.5743_acc_0.6281_epoch_3.pth`
+- validation score used for saving best checkpoint:
+  - `acc@0.5 = 0.6281`
+  - `macro_f1@0.5 = 0.5743`
+  - `AP = 0.8406`
+- calibrated operating point reported later in this document:
+  - `acc@0.36 = 0.7519`
+  - `macro_f1@0.36 = 0.7516`
+
+也就是說，detector 總共訓練 `4` 個 epoch，但最後作為正式 binary classification report 主體的 checkpoint 是 **第 `3` 個 epoch**。
+
+### 7.3 Best Checkpoint Summary
+
+為了避免混淆，最終報告實際採用的是：
+
+- Gemma explanation model:
+  - trained for `3` epochs
+  - best checkpoint: `epoch_002`
+  - selected by held-out epoch-level formal eval on explanation-side metrics
+
+- CLIP detector:
+  - trained for `4` epochs
+  - best checkpoint: `epoch_003`
+  - selected by `macro_f1@0.5` on held-out binary validation
+  - reported with both `@0.5` and calibrated `@0.36` operating points
 
 ## 8. Evaluation Design
 
@@ -799,14 +898,18 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 - JSON parse 與 criterion-level scoring
 - explanation text metric 計算
 
-目前 `128` 張 balanced slice 已花 `4520.94` 秒，平均 `35.32` 秒 / sample。若直接擴到 `3208` 筆，成本會接近數十小時，因此 final report 只把 explanation metrics 當成固定 seed 的 balanced slice 指標，而不是 full-dataset 指標。
+目前 `128` 張 balanced slice 的 explanation eval，`epoch_001` 花 `4520.94` 秒、`epoch_002` 花 `10522.03` 秒。若直接擴到 `3208` 筆，成本會接近數十小時，因此 final report 只把 explanation metrics 當成固定 seed 的 balanced slice 指標，而不是 full-dataset 指標。
 
 對應檔案：
 
 - binary full-eval JSON: `student/outputs/detector_eval_threshold_0p36_retrain_full.json`
 - binary full-eval Markdown: `student/outputs/detector_eval_threshold_0p36_retrain_full.md`
-- explanation slice JSON: `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.json`
-- explanation slice Markdown: `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.md`
+- explanation slice JSON:
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.json`
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_002_slice128_thr050.json`
+- explanation slice Markdown:
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.md`
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_002_slice128_thr050.md`
 
 ## 9. Current Experimental Results
 
@@ -819,30 +922,38 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 - split: held-out `eval`
 - sample count: `3208`
 - class balance: `1604` Real + `1604` AI-Generated
-- detector threshold: `0.36`
+- detector thresholds compared: `0.50` and `0.36`
 - checkpoint: `student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/clip_lora_retrain_ckpt_repro_20260615_113122/model_best_f1_0.5743_acc_0.6281_epoch_3.pth`
-- output: `student/outputs/detector_eval_threshold_0p36_retrain_full.json`
+- outputs:
+  - `student/outputs/detector_eval_threshold_0p5_retrain_full.json`
+  - `student/outputs/detector_eval_threshold_0p36_retrain_full.json`
 
 結果：
 
-| Metric | Value |
-| --- | ---: |
-| sample_count | 3208 |
-| detector_threshold | 0.3600 |
-| overall_accuracy | 0.7519 |
-| overall_macro_f1 | 0.7516 |
-| average_precision | 0.8406 |
-| real_false_positive_rate | 0.2163 |
-| wall_time_sec | 123.80 |
-| sec_per_sample | 0.0386 |
+| Metric | @0.5 | @0.36 |
+| --- | ---: | ---: |
+| sample_count | 3208 | 3208 |
+| overall_accuracy | 0.6281 | 0.7519 |
+| overall_macro_f1 | 0.5743 | 0.7516 |
+| average_precision | 0.8406 | 0.8406 |
+| real_false_positive_rate | 0.0162 | 0.2163 |
+| wall_time_sec | 233.59 | 123.80 |
+| sec_per_sample | 0.0728 | 0.0386 |
 
-這是目前最適合作為 binary classification headline 的數字，因為它滿足三個條件：
+註記方式應明確寫成：
+
+- `acc@0.5 = 0.6281`
+- `macro_f1@0.5 = 0.5743`
+- `acc@0.36 = 0.7519`
+- `macro_f1@0.36 = 0.7516`
+
+其中 `@0.36` 是目前最適合作為 binary classification headline 的 operating point，因為它滿足三個條件：
 
 - 使用完整 held-out eval split，不是 sample slice
 - 使用重新訓練後可重載驗證的 CLIP LoRA checkpoint
 - threshold 已依 validation sweep 校準到 `0.36`
 
-和 `threshold=0.5` 相比，`0.36` 會抓到更多 AI-Generated image，因此 `accuracy` 與 `macro F1` 明顯上升；代價是 Real image 的 false positive rate 也上升到 `0.2163`。這是目前 detector 的主要 operating point trade-off。
+和 `threshold=0.5` 相比，`0.36` 會抓到更多 AI-Generated image，因此 `accuracy` 與 `macro F1` 明顯上升；代價是 Real image 的 false positive rate 也上升到 `0.2163`。相對地，`0.5` 比較保守，`real_false_positive_rate` 只有 `0.0162`，但會明顯犧牲 fake recall，因此 `acc@0.5` 與 `macro_f1@0.5` 都低很多。這是目前 detector 的主要 operating point trade-off。
 
 ### 9.2 Explanation / Structure Metrics: Balanced 128-Sample Slice
 
@@ -854,29 +965,34 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 - eval slice count: `128`
 - slice seed: `42`
 - class balance: random `64` Real + `64` AI-Generated
-- adapter: `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/epoch_checkpoints/epoch_001`
-- output: `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.json`
+- detector checkpoint: `student/outputs/detectors/holmes_clip_lora_vitl14_336/checkpoints/model_epoch_0.94_0.99.pth`
+- detector threshold: `0.5`
+- outputs:
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_001_slice128_thr050.json`
+  - `student/outputs/gemma4_e2b_epoch_eval_rerun_20260612/full_eval/epoch_002_slice128_thr050.json`
 
 結果：
 
-| Metric | Value |
-| --- | ---: |
-| sample_count | 128 |
-| json_parse_rate | 0.9063 |
-| trace_json_parse_rate | 1.0000 |
-| criterion_macro_f1 | 0.0071 |
-| support_type_accuracy | 0.2793 |
-| taxonomy_accuracy | 0.5684 |
-| consistency_score | 0.9990 |
-| BLEU-1 | 0.4395 |
-| ROUGE-L | 0.4320 |
-| METEOR | 0.4775 |
-| wall_time_sec | 4520.94 |
-| sec_per_sample | 35.32 |
+| Metric | epoch_001 | epoch_002 |
+| --- | ---: | ---: |
+| sample_count | 128 | 128 |
+| json_parse_rate | 0.9063 | 1.0000 |
+| trace_json_parse_rate | 1.0000 | 1.0000 |
+| overall_accuracy | 0.5313 | 0.5469 |
+| overall_macro_f1 | 0.4747 | 0.4922 |
+| criterion_macro_f1 | 0.0071 | 0.1032 |
+| support_type_accuracy | 0.2793 | 0.2617 |
+| taxonomy_accuracy | 0.5684 | 0.5684 |
+| consistency_score | 0.9990 | 0.9990 |
+| BLEU-1 | 0.4395 | 0.4851 |
+| ROUGE-L | 0.4320 | 0.5712 |
+| METEOR | 0.4775 | 0.5167 |
+| wall_time_sec | 4520.94 | 10522.03 |
+| sec_per_sample | 35.32 | 82.20 |
 
 這組結果的定位是 explanation / structure evaluation，而不是正式 binary classification headline。binary classification 已經由 full eval split 報告；這裡主要看 student 是否能生成可解析、可對齊的 structured explanation。
 
-需要注意的是，這份 128-slice report 使用的是 `epoch_001` adapter；training-time epoch ranking 另外顯示 `epoch_002` 的 explanation-side 指標更好。因此最終報告可以引用這份 128-slice 作為「balanced explanation evaluation 成本與結果」；如果要選 deployment explanation checkpoint，仍以 `epoch_002` 的 training-time ranking 為主要依據。
+128-slice 正式比較也支持 `epoch_002` 優於 `epoch_001`：`epoch_002` 的 parse rate、criterion-level F1、BLEU-1、ROUGE-L、METEOR 都更好；只有 `support_type_accuracy` 略低，`taxonomy_accuracy` 與 `consistency_score` 則幾乎持平。因此目前可以說，`epoch_002` 不只在 training-time `64`-sample epoch ranking 較好，在更正式的 `128`-sample explanation slice 上也維持同樣方向的提升。
 
 ### 9.3 Epoch-by-Epoch Explanation Ranking
 
@@ -900,7 +1016,22 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 
 ### 9.4 Best Epoch Interpretation
 
-`epoch_002` 的意義不是把 binary classification 拉高，而是把 student 的 explanation / structure 能力推到目前三個 epoch 中最好的平衡點：
+`epoch_002` 的意義不是把 binary classification 拉高，而是把 student 的 explanation / structure 能力推到目前三個 epoch 中最好的平衡點。這個判斷現在同時被兩組 evidence 支持：
+
+- training-time balanced `64`-sample epoch ranking
+- 正式 balanced `128`-sample explanation slice
+
+在 `128`-sample slice 上，`epoch_002` 的對應數字是：
+
+- `json_parse_rate = 1.0000`
+- `criterion_macro_f1 = 0.1032`
+- `support_type_accuracy = 0.2617`
+- `taxonomy_accuracy = 0.5684`
+- `BLEU-1 = 0.4851`
+- `ROUGE-L = 0.5712`
+- `METEOR = 0.5167`
+
+在 training-time epoch ranking 上，`epoch_002` 仍保有最高的 explanation-side 綜合表現：
 
 - `json_parse_rate = 0.8594`
 - `criterion_macro_f1 = 0.4398`
@@ -913,7 +1044,7 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 這代表：
 
 1. student 的 structured output 穩定度在 `epoch_002` 明顯優於 `epoch_001`
-2. criterion-level artifact reasoning 在 `epoch_002` 才開始形成可見訊號
+2. criterion-level artifact reasoning 在 `epoch_002` 才開始形成可見訊號，而且這個訊號在正式 `128`-sample slice 上也能重現
 3. 到 `epoch_003` 時，binary label 沒變，但 explanation-side quality 有輕微回落，顯示 explanation 任務可能在第 2 個 epoch 左右就接近最佳點
 
 ### 9.5 Why Explanation Metrics Use 128 Samples
@@ -929,7 +1060,8 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
   - 每筆都要做 trace generation
   - 還要做 final JSON generation
   - 再做 parse 與 explanation metric 計算
-  - `128` 筆已花 `4520.94` 秒，平均 `35.32` 秒 / sample
+  - `epoch_001` 的 `128` 筆花 `4520.94` 秒，平均 `35.32` 秒 / sample
+  - `epoch_002` 的 `128` 筆花 `10522.03` 秒，平均 `82.20` 秒 / sample
 
 所以目前策略是：
 
@@ -975,6 +1107,7 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 - detector-first + multi-task SFT 的完整 pipeline 已打通
 - held-out eval split 與 epoch-level formal eval 已建立
 - `epoch_002` 在 explanation-side 指標上優於 `epoch_001` 與 `epoch_003`
+- `epoch_002` 的 `128`-sample explanation slice 也優於 `epoch_001`
 - `json_parse_rate`
 - `trace_json_parse_rate`
 - `BLEU-1`
@@ -993,13 +1126,13 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 
 以下幾類不建議單獨拿大標呈現，否則會很難解釋，甚至會讓讀者誤會系統整體失敗：
 
-- `epoch_001_slice128_thr050` 的 `overall_accuracy` 與 `overall_macro_f1`
+- `epoch_001_slice128_thr050` / `epoch_002_slice128_thr050` 的 `overall_accuracy` 與 `overall_macro_f1`
   - 這是 128-sample explanation slice 上的 detector_student binary result
   - 現在已經有完整 `3208` 筆 eval rows 的 detector-only 分數，因此 slice binary result 不應當主 classification headline
 
 - `criterion_macro_f1 = 0.0071`
-  - 這個數字太低，而且只代表某一個特定 offline run
-  - 如果直接當主結果，會掩蓋其實 `epoch_002` 已有 `0.4398` 的進展
+  - 這是 `epoch_001` 在 128-sample explanation slice 上的結果
+  - 如果直接當主結果，會掩蓋 `epoch_002` 在同 slice 已提升到 `0.1032`，也掩蓋 training-time ranking 中 `0.4398` 的進展
 
 - `support_type_accuracy = 0.2793`
   - 這是困難 supervision 的 early-stage diagnostic
@@ -1012,13 +1145,14 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 1. **主結果**
    - 系統已完成 Holmes-derived supervision pipeline
    - student 已具備穩定 structured explanation generation 能力
-   - detector 在完整 eval split 上的 `overall_accuracy = 0.7519`、`overall_macro_f1 = 0.7516`（`threshold=0.36`）
+   - detector 在完整 eval split 上的 `acc@0.5 = 0.6281 / macro_f1@0.5 = 0.5743`
+   - detector 在完整 eval split 上的 `acc@0.36 = 0.7519 / macro_f1@0.36 = 0.7516`
    - 最佳 checkpoint 為 `epoch_002`
 
 2. **量化結果**
    - classification 用 full-eval detector-only 結果
    - 用 `epoch_002` 的 training-time ranking 作為 student checkpoint selection 依據
-   - 用 `epoch_001` 的 128-slice report 說明 explanation evaluation 的實際成本與已跑出的 balanced-slice 指標
+   - 用 `epoch_001` / `epoch_002` 的 128-slice report 說明 explanation evaluation 的實際成本與 balanced-slice 改善幅度
 
 3. **誠實揭露限制**
    - binary classification 仍高度受 detector threshold calibration 影響
@@ -1036,7 +1170,7 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 - detector-first 架構讓分類與解釋責任分離，分析與部署都較清楚
 - multi-task SFT 已建立出可診斷的中介層，而不是只有 final answer
 - `epoch_002` 顯示 taxonomy 與 criterion-level reasoning 的 supervision 確實有學習效果
-- retrained CLIP LoRA detector 搭配 `threshold=0.36` 後，在完整 eval split 上達到 `accuracy 0.7519 / macro F1 0.7516`
+- retrained CLIP LoRA detector 在完整 eval split 上的對照為：`acc@0.5 = 0.6281 / macro_f1@0.5 = 0.5743`，`acc@0.36 = 0.7519 / macro_f1@0.36 = 0.7516`
 
 ### 11.2 What Is Not Working Yet
 
@@ -1047,9 +1181,9 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 
 ## 12. Recommended Next Steps
 
-1. **用 `epoch_002` 當主 student checkpoint 做更完整 offline eval**
-   - 目前 128-slice explanation report 是 `epoch_001`
-   - 若時間允許，下一輪應用同樣 `64 Real + 64 AI-Generated` slice 設定補跑 `epoch_002`
+1. **以 `epoch_002` 作為主要 student explanation checkpoint**
+   - `epoch_002` 已完成同設定 `128`-slice explanation eval
+   - 後續若要再擴大，只需要把同樣 protocol 往更大 slice 或 full eval 推進，不需要再補基本比較
 
 2. **把 detector calibration 與 student explanation 分開報**
    - detector 報完整 eval split 的 `overall_accuracy / overall_macro_f1 / real_false_positive_rate`
@@ -1063,4 +1197,4 @@ explanation metrics 不跑完整 `3208` 筆，是因為 `detector_student` two-s
 
 ## 13. One-Sentence Summary
 
-本專案目前已建立完整的 Holmes-to-derived supervision pipeline 與 detector-first student stack；使用重新訓練的 CLIP LoRA detector 與校準後 `threshold=0.36` 時，完整 `eval` split 上的 detector-only classification 為 `accuracy 0.7519 / macro F1 0.7516`，而 Gemma student 的 explanation metrics 以固定 seed 的 balanced `128` sample slice 評估，因為 two-stage 文字生成成本過高，不適合每次都跑完整 `3208` 筆。
+本專案目前已建立完整的 Holmes-to-derived supervision pipeline 與 detector-first student stack；使用重新訓練的 CLIP LoRA detector 時，完整 `eval` split 上的 detector-only classification 為 `acc@0.5 = 0.6281 / macro_f1@0.5 = 0.5743`，校準到 `threshold=0.36` 後則提升到 `acc@0.36 = 0.7519 / macro_f1@0.36 = 0.7516`，而 Gemma student 的 explanation metrics 以固定 seed 的 balanced `128` sample slice 評估，因為 two-stage 文字生成成本過高，不適合每次都跑完整 `3208` 筆。
